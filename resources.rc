@@ -1,8 +1,8 @@
 MAINICON ICON "Toast.ico"
 
 1 VERSIONINFO
-FILEVERSION     1,0,5,0
-PRODUCTVERSION  1,0,5,0
+FILEVERSION     1,0,7,0
+PRODUCTVERSION  1,0,7,0
 FILEFLAGSMASK   0x3fL
 FILEFLAGS       0x0L
 FILEOS          0x40004L
@@ -15,11 +15,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Toast"
             VALUE "FileDescription",  "Toast"
-            VALUE "FileVersion",      "1.0.5"
+            VALUE "FileVersion",      "1.0.7"
             VALUE "InternalName",     "Toast"
             VALUE "OriginalFilename", "Toast.exe"
             VALUE "ProductName",      "Toast"
-            VALUE "ProductVersion",   "1.0.5"
+            VALUE "ProductVersion",   "1.0.7"
         END
     END
     BLOCK "VarFileInfo"
