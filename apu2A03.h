@@ -20,6 +20,8 @@ public:
     void Clock();
 
     bool IrqRequested() const { return frameIrq || dmc.irqPending; }
+    bool FrameIrqFlag() const { return frameIrq; }
+    bool DmcIrqFlag() const { return dmc.irqPending; }
 
     void SaveState(StateWriter& w) const;
     void LoadState(StateReader& r);

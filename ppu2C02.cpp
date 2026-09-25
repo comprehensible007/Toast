@@ -1,8 +1,5 @@
 #include "ppu2C02.h"
 
-static int ticksThisScanline = 0;
-static int lastLoggedScanline = -1000;
-
 Ppu2C02::Ppu2C02()
 {
     InitPaletteTable();
@@ -52,8 +49,8 @@ void Ppu2C02::Reset()
     prevA12 = 0;
     globalDotCounter = 0;
     lowStartDot = 0;
+    oddFrame = false;
     renderingWasEnabled = false;
-    lastA12TickScanline = -1000;
     nmiRequested = false;
     std::memset(nameTable, 0, sizeof(nameTable));
     std::memset(paletteRAM, 0, sizeof(paletteRAM));
@@ -135,19 +132,18 @@ u8 Ppu2C02::PpuReadFetch(u16 addr)
     {
         if (!prevA12)
         {
-            long long dotsLow = globalDotCounter - lowStartDot;
-            if (dotsLow >= 8)
+            if ((globalDotCounter - lowStartDot) >= 8)
             {
                 if (cart) cart->ScanlineTick();
-                static FILE* a12Log = nullptr;
-                if (!a12Log) a12Log = fopen("a12_log.txt", "w");
-                if (a12Log) { fprintf(a12Log, "TICK scanline=%d cycle=%d dotsLow=%lld\n", scanline, cycle, dotsLow); fflush(a12Log); }
             }
         }
     }
     else
     {
-        if (prevA12) lowStartDot = globalDotCounter;
+        if (prevA12)
+        {
+            lowStartDot = globalDotCounter;
+        }
     }
     prevA12 = high ? 1 : 0;
     return PpuRead(addr);
@@ -236,87 +232,6 @@ void Ppu2C02::CpuWrite(u16 addr, u8 data)
 u8 Ppu2C02::GetPalette(u8 pal, u8 pixel)
 {
     return PpuRead(0x3F00 + (pal << 2) + pixel) & 0x3F;
-}
-
-void Ppu2C02::DebugDump(FILE* f) const
-{
-    fprintf(f, "PPUCTRL=0x%02X PPUMASK=0x%02X\n", ctrl, mask);
-    fprintf(f, "OAM (Y tile attr X), skipping sprites parked off-screen:\n");
-    for (int i = 0; i < 64; i++)
-    {
-        u8 y = oam[i*4+0], t = oam[i*4+1], a = oam[i*4+2], x = oam[i*4+3];
-        if (y >= 240) continue;
-        fprintf(f, "  [%2d] Y=%3d tile=0x%02X attr=0x%02X X=%3d %s%s%s\n",
-                i, y, t, a, x,
-                (a & 0x20) ? "BEHIND " : "front  ",
-                (a & 0x40) ? "flipH " : "",
-                (a & 0x80) ? "flipV " : "");
-    }
-}
-
-void Ppu2C02::DebugDumpNametable(FILE* f) const
-{
-    fprintf(f, "Nametable 0, first 8 rows (32 tiles wide):\n");
-    for (int row = 0; row < 8; row++)
-    {
-        fprintf(f, "  row %d: ", row);
-        for (int col = 0; col < 32; col++)
-        {
-            fprintf(f, "%02X ", nameTable[0][row * 32 + col]);
-        }
-        fprintf(f, "\n");
-    }
-}
-
-void Ppu2C02::DebugDumpPatternTiles(FILE* f) const
-{
-    fprintf(f, "Background pattern base: 0x%04X\n", (ctrl & 0x10) ? 0x1000 : 0x0000);
-    for (int tile = 0; tile < 4; tile++)
-    {
-        fprintf(f, "Tile %d:\n", tile);
-        u16 base = ((ctrl & 0x10) ? 0x1000 : 0x0000) + tile * 16;
-        for (int row = 0; row < 8; row++)
-        {
-            u8 lo = PpuRead((u16)(base + row));
-            u8 hi = PpuRead((u16)(base + row + 8));
-            fprintf(f, "  ");
-            for (int bit = 7; bit >= 0; bit--)
-            {
-                u8 p0 = (lo >> bit) & 1;
-                u8 p1 = (hi >> bit) & 1;
-                fprintf(f, "%d", (p1 << 1) | p0);
-            }
-            fprintf(f, "\n");
-        }
-    }
-}
-
-void Ppu2C02::DebugDumpUsedTiles(FILE* f) const
-{
-    fprintf(f, "Tiles actually referenced in nametable 0 rows 0-7:\n");
-    bool seen[256] = {};
-    for (int i = 0; i < 8 * 32; i++) seen[nameTable[0][i]] = true;
-
-    u16 patternBase = (ctrl & 0x10) ? 0x1000 : 0x0000;
-    for (int tile = 0; tile < 256; tile++)
-    {
-        if (!seen[tile]) continue;
-        fprintf(f, "Tile 0x%02X:\n", tile);
-        u16 base = (u16)(patternBase + tile * 16);
-        for (int row = 0; row < 8; row++)
-        {
-            u8 lo = PpuRead((u16)(base + row));
-            u8 hi = PpuRead((u16)(base + row + 8));
-            fprintf(f, "  ");
-            for (int bit = 7; bit >= 0; bit--)
-            {
-                u8 p0 = (lo >> bit) & 1;
-                u8 p1 = (hi >> bit) & 1;
-                fprintf(f, "%d", (p1 << 1) | p0);
-            }
-            fprintf(f, "\n");
-        }
-    }
 }
 
 void Ppu2C02::IncScrollX()
@@ -542,12 +457,6 @@ void Ppu2C02::Clock()
     if (scanline == -1 && cycle == 1)
     {
         status &= ~0xE0;
-        lastA12TickScanline = -1000;
-    }
-
-    if (scanline == -1 && cycle == 1)
-    {
-        status &= ~0xE0;
     }
 
     if (scanline >= -1 && scanline < 240 && (mask & 0x18))
@@ -609,7 +518,11 @@ void Ppu2C02::Clock()
         {
             int slot = (cycle - 257) / 8;
             int within = (cycle - 257) % 8;
-            if (within == 4 || within == 6)
+            if (within == 0 || within == 2)
+            {
+                PpuReadFetch((u16)(0x2000 | (vramAddr & 0x0FFF)));
+            }
+            else if (within == 4 || within == 6)
             {
                 bool high = (within == 6);
                 if (slot < spriteCount) FetchSpritePatternByte(slot, high);
@@ -639,6 +552,10 @@ void Ppu2C02::Clock()
     }
 
     cycle++;
+    if (scanline == -1 && cycle == 339 && (mask & 0x18) && oddFrame)
+    {
+        cycle = 340;
+    }
     if (cycle > 340)
     {
         cycle = 0;
@@ -646,6 +563,7 @@ void Ppu2C02::Clock()
         if (scanline > 260)
         {
             scanline = -1;
+            oddFrame = !oddFrame;
         }
     }
 }
@@ -670,10 +588,15 @@ void Ppu2C02::SaveState(StateWriter& w) const
         w.U8(spriteScanline[i].attr); w.U8(spriteScanline[i].x);
         w.U8(spriteShifterLo[i]); w.U8(spriteShifterHi[i]);
     }
+    w.U8(oamAddr);
+    w.Bytes(oam, sizeof(oam));
     w.Bool(spriteZeroHitPossible);
     w.U16(ppuAddressBus);
-    w.Bytes(oam, sizeof(oam));
-    w.U8(oamAddr);
+    w.U8(prevA12);
+    w.S64((int64_t)globalDotCounter);
+    w.S64((int64_t)lowStartDot);
+    w.Bool(oddFrame);
+    w.Bool(renderingWasEnabled);
     w.Bool(nmiRequested);
 }
 
@@ -697,12 +620,14 @@ void Ppu2C02::LoadState(StateReader& r)
         spriteScanline[i].attr = r.U8(); spriteScanline[i].x = r.U8();
         spriteShifterLo[i] = r.U8(); spriteShifterHi[i] = r.U8();
     }
+    oamAddr = r.U8();
+    r.Bytes(oam, sizeof(oam));
     spriteZeroHitPossible = r.Bool();
     ppuAddressBus = r.U16();
-    r.Bytes(oam, sizeof(oam));
-    oamAddr = r.U8();
+    prevA12 = r.U8();
+    globalDotCounter = (long long)r.S64();
+    lowStartDot = (long long)r.S64();
+    oddFrame = r.Bool();
+    renderingWasEnabled = r.Bool();
     nmiRequested = r.Bool();
-    prevA12 = 0;
-    globalDotCounter = 0;
-    lowStartDot = 0;
 }

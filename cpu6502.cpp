@@ -18,7 +18,7 @@ void Cpu6502::Reset()
 
     a = 0; x = 0; y = 0;
     sp = 0xFD;
-    status = 0x00 | U;
+    status = 0x00 | U | I;
 
     addrRel = 0; addrAbs = 0; fetched = 0;
     cyclesRemaining = 8;
@@ -27,6 +27,7 @@ void Cpu6502::Reset()
 void Cpu6502::IRQ()
 {
     if (GetFlag(I)) return;
+    if (irqSourceTraceArm);
     Write(0x0100 + sp, (pc >> 8) & 0xFF); sp--;
     Write(0x0100 + sp, pc & 0xFF); sp--;
     SetFlag(B, false);
@@ -54,22 +55,28 @@ void Cpu6502::NMI()
     u16 lo = Read(addrAbs);
     u16 hi = Read(addrAbs + 1);
     pc = (hi << 8) | lo;
-    cyclesRemaining = 8;
+    cyclesRemaining = 7;
 }
 
 void Cpu6502::Clock()
 {
+    if (cyclesRemaining == 1)
+    {
+        irqSampled = irqLine && !GetFlag(I);
+        nmiSampled = nmiPending;
+    }
+
     if (cyclesRemaining == 0)
     {
-
-        if (nmiPending)
+        if (nmiSampled)
         {
+            nmiSampled = false;
             nmiPending = false;
             NMI();
         }
-        else if (irqLine && !GetFlag(I))
+        else if (irqSampled)
         {
-
+            irqSampled = false;
             IRQ();
         }
         else
@@ -363,9 +370,9 @@ u8 Cpu6502::TXS() { sp = x; return 0; }
 u8 Cpu6502::PHA() { Write(0x0100 + sp, a); sp--; return 0; }
 u8 Cpu6502::PHP() { Write(0x0100 + sp, status | B | U); sp--; return 0; }
 u8 Cpu6502::PLA() { sp++; a = Read(0x0100 + sp); SetFlag(Z, a == 0); SetFlag(N, a & 0x80); return 0; }
-u8 Cpu6502::PLP() { sp++; status = Read(0x0100 + sp); SetFlag(U, true); return 0; }
+u8 Cpu6502::PLP() { sp++; status = Read(0x0100 + sp); SetFlag(U, true); SetFlag(B, false); return 0; }
 
-u8 Cpu6502::NOP() { return 0; }
+u8 Cpu6502::NOP() { return 1; }
 u8 Cpu6502::XXX() { return 0; }
 
 void Cpu6502::BuildTable()
@@ -502,11 +509,4 @@ void Cpu6502::LoadState(StateReader& r)
     fetched = r.U8(); addrAbs = r.U16(); addrRel = r.U16();
     opcode = r.U8(); cyclesRemaining = r.U8();
     nmiPending = r.Bool(); irqLine = r.Bool();
-}
-
-void Cpu6502::DebugDump(FILE* f) const
-{
-    fprintf(f, "CPU: PC=0x%04X A=0x%02X X=0x%02X Y=0x%02X SP=0x%02X status=0x%02X (I=%d) irqLine=%d nmiPending=%d cyclesRemaining=%d samePcStreak=%lld\n",
-        pc, a, x, y, sp, status, (status & I) ? 1 : 0,
-        irqLine ? 1 : 0, nmiPending ? 1 : 0, cyclesRemaining, samePcStreak);
 }

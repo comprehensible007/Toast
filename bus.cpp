@@ -19,7 +19,21 @@ void Bus::Reset()
 u8 Bus::CpuRead(u16 addr)
 {
     u8 data = 0;
-    if (cart && cart->CpuRead(addr, data)) return data;
+    if (cart && cart->CpuRead(addr, data))
+    {
+    	if (addr >= 0x8000 && !gameGenie.empty())
+    	{
+    		for (const auto& c : gameGenie)
+    		{
+    			if (c.addr == addr && (!c.hasCompare || c.compare == data))
+    			{
+    				data = c.value;
+    				break;
+				}
+			}
+		}
+		return data;
+	}
 
     if (addr <= 0x1FFF) return ram[addr & 0x07FF];
     if (addr >= 0x2000 && addr <= 0x3FFF) return ppu.CpuRead(addr & 0x0007);
@@ -78,20 +92,11 @@ void Bus::Clock()
     if (totalCycles % 3 == 0)
     {
         apu.Clock();
+        if (cart) cart->ClockCpuCycle();
 
         if (dmaInProgress)
         {
-        	if (!dmaLoggedThisSession && !(ppu.GetScanline() >= 241 && ppu.GetScanline() <= 260) && ppu.GetScanline() != -1)
-        {
-        FILE* f = fopen("dma_log.txt", "w");
-        if (f)
-        {
-            fprintf(f, "DMA active during visible picture: scanline=%d cycle=%d dmaAddr=%d\n",
-                    ppu.GetScanline(), ppu.GetCycle(), dmaAddr);
-            fclose(f);
-        }
-        dmaLoggedThisSession = true;
-        }
+            dmaStallCount++;
             if (dmaWaitAlign)
             {
                 if (totalCycles % 2 == 1) dmaWaitAlign = false;
@@ -116,6 +121,7 @@ void Bus::Clock()
         }
         else
         {
+            dmaStallCount = 0;
 
             if (cpu) { cpu->SetIRQLine(apu.IrqRequested() || (cart && cart->IRQState())); cpu->Clock(); }
         }

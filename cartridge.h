@@ -19,9 +19,10 @@ public:
     bool PpuWrite(u16 addr, u8 data) { return mapper && mapper->PpuWrite(addr, data); }
 
     void ScanlineTick() { if (mapper) mapper->OnScanline(); }
+    void ClockCpuCycle() { if (mapper) mapper->ClockCpuCycle(); }
     bool IRQState() const { return mapper && mapper->IRQState(); }
     void IRQClear() { if (mapper) mapper->IRQClear(); }
-    void DebugDumpMapper(FILE* f) const { if (mapper) mapper->DebugDump(f); }
+    void ArmIrqTrace(int count) { if (mapper) mapper->ArmIrqTrace(count); }
 
     void SaveState(StateWriter& w) const;
     void LoadState(StateReader& r);

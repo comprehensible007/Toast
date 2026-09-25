@@ -33,6 +33,9 @@ public:
     void Clock();
 
     bool InstructionComplete() const { return cyclesRemaining == 0; }
+    bool irqSampled = false;
+    bool nmiSampled = false;
+    bool irqSourceTraceArm = false;
 
     u8 fetched = 0;
     u16 addrAbs = 0;
@@ -42,7 +45,6 @@ public:
     
     void SaveState(StateWriter& w) const;
     void LoadState(StateReader& r);
-    void DebugDump(FILE* f) const;
     
 
 private:

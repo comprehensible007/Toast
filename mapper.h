@@ -3,7 +3,6 @@
 #include "SaveStateIO.h"
 #include <vector>
 #include <cstdint>
-#include <cstdio>
 
 enum class Mirroring { HORIZONTAL, VERTICAL, FOUR_SCREEN, SINGLE_SCREEN_LOW, SINGLE_SCREEN_HIGH };
 
@@ -26,10 +25,11 @@ public:
     virtual Mirroring GetMirroring() const { return mirroring; }
 
     virtual void OnScanline() {}
+    virtual void ClockCpuCycle() {}
     virtual bool IRQState() const { return false; }
     virtual void IRQClear() {}
-    virtual void DebugDump(FILE* f) const {}
-    virtual void SetTracing(bool /*on*/) {}
+    virtual void SetTracing(bool) {}
+    virtual void ArmIrqTrace(int) {}
 
     virtual void SaveState(StateWriter& w) const
     {

@@ -24,7 +24,7 @@
 #include <vector>
 #include <ctime>
 #include <cwchar>
-#include <cstdio> // remove this later
+#include <cstdio>
 
 #include "cartridge.h"
 #include "bus.h"
@@ -45,6 +45,8 @@ enum : UINT_PTR
     ID_INPUT_CONFIG = 2,
     ID_OPTIONS = 3,
     ID_HEX_EDITOR = 4,
+    ID_GAME_GENIE = 7,
+    ID_TOAST_CONFIG = 8,
     ID_SAVE_STATE_ZIP = 5,
     ID_LOAD_STATE_ZIP = 6,
     ID_SAVE_SLOT_BASE = 10,
@@ -54,6 +56,8 @@ enum : UINT_PTR
 Cartridge g_cart;
 Bus       g_bus;
 Cpu6502   g_cpu;
+
+void GameGenieClearAll();
 
 bool g_romLoaded = false;
 bool g_running = false;
@@ -251,6 +255,295 @@ void LoadKeyBindings()
             }
         }
     }
+}
+
+struct ToastBindings
+{
+    int Reset = 'R';
+    int OpenRom = 'O';
+    int InputConfig = 'I';
+    int ToastConfig = 'T';
+    int Options = 'P';
+    int HexEditor = 'H';
+    int GameGenie = 'G';
+    int PauseResume = VK_F8;
+};
+
+static ToastBindings g_toastKeys;
+static const wchar_t* kToastActionNames[8] = {
+    L"Reset", L"OpenRom", L"InputConfig", L"ToastConfig",
+    L"Options", L"HexEditor", L"GameGenie", L"PauseResume"
+};
+
+int* ToastBindingSlotOf(ToastBindings& kb, int index)
+{
+    switch (index)
+    {
+    case 0: return &kb.Reset;
+    case 1: return &kb.OpenRom;
+    case 2: return &kb.InputConfig;
+    case 3: return &kb.ToastConfig;
+    case 4: return &kb.Options;
+    case 5: return &kb.HexEditor;
+    case 6: return &kb.GameGenie;
+    default: return &kb.PauseResume;
+    }
+}
+
+std::wstring GetToastBindingsFilePath()
+{
+    return GetConfigDir() + L"\\toastbinds.cfg";
+}
+
+void SaveToastBindings()
+{
+    std::wofstream f(NarrowPath(GetToastBindingsFilePath()).c_str());
+    if (!f.is_open()) return;
+    for (int i = 0; i < 8; i++)
+        f << kToastActionNames[i] << L"=" << *ToastBindingSlotOf(g_toastKeys, i) << L"\n";
+}
+
+void LoadToastBindings()
+{
+    std::wifstream f(NarrowPath(GetToastBindingsFilePath()).c_str());
+    if (!f.is_open()) return;
+
+    std::wstring line;
+    while (std::getline(f, line))
+    {
+        size_t eq = line.find(L'=');
+        if (eq == std::wstring::npos) continue;
+        std::wstring name = line.substr(0, eq);
+        int val = _wtoi(line.substr(eq + 1).c_str());
+        if (val <= 0) continue;
+
+        for (int i = 0; i < 8; i++)
+        {
+            if (name == kToastActionNames[i]) { *ToastBindingSlotOf(g_toastKeys, i) = val; break; }
+        }
+    }
+}
+
+HMENU g_fileMenu = nullptr;
+HMENU g_inputMenu = nullptr;
+HMENU g_optionsMenu = nullptr;
+HMENU g_toolsMenu = nullptr;
+
+std::wstring MenuAccelText(int vk)
+{
+    return L"\tCtrl+" + KeyName(vk);
+}
+
+void RebuildMenuAccelerators()
+{
+    if (g_fileMenu)
+        ModifyMenuW(g_fileMenu, ID_FILE_OPEN, MF_BYCOMMAND | MF_STRING, ID_FILE_OPEN,
+            (L"Open ROM..." + MenuAccelText(g_toastKeys.OpenRom)).c_str());
+
+    if (g_inputMenu)
+    {
+        ModifyMenuW(g_inputMenu, ID_INPUT_CONFIG, MF_BYCOMMAND | MF_STRING, ID_INPUT_CONFIG,
+            (L"Configure NES..." + MenuAccelText(g_toastKeys.InputConfig)).c_str());
+        ModifyMenuW(g_inputMenu, ID_TOAST_CONFIG, MF_BYCOMMAND | MF_STRING, ID_TOAST_CONFIG,
+            (L"Configure Toast..." + MenuAccelText(g_toastKeys.ToastConfig)).c_str());
+    }
+
+    if (g_optionsMenu)
+        ModifyMenuW(g_optionsMenu, ID_OPTIONS, MF_BYCOMMAND | MF_STRING, ID_OPTIONS,
+            (L"Preferences..." + MenuAccelText(g_toastKeys.Options)).c_str());
+
+    if (g_toolsMenu)
+    {
+        ModifyMenuW(g_toolsMenu, ID_HEX_EDITOR, MF_BYCOMMAND | MF_STRING, ID_HEX_EDITOR,
+            (L"Hex Editor..." + MenuAccelText(g_toastKeys.HexEditor)).c_str());
+        ModifyMenuW(g_toolsMenu, ID_GAME_GENIE, MF_BYCOMMAND | MF_STRING, ID_GAME_GENIE,
+            (L"Game Genie..." + MenuAccelText(g_toastKeys.GameGenie)).c_str());
+    }
+
+    if (g_mainHwnd) DrawMenuBar(g_mainHwnd);
+}
+
+static HWND g_toastConfigHwnd = nullptr;
+static ToastBindings g_toastTempKeys;
+static int g_toastListeningIndex = -1;
+static bool g_toastConflict[8]{};
+static const int ID_TOAST_REBIND_BASE = 500;
+static const int ID_TOAST_SAVE = 600;
+static const int ID_TOAST_CANCEL = 601;
+static const int ID_TOAST_TIMER_KEYPOLL = 3;
+static const wchar_t* kToastConfigClass = L"NesEmuToastConfigClass";
+static const wchar_t* kToastActionLabels[8] = {
+    L"Reset", L"Open ROM", L"Configure NES", L"Configure Toast",
+    L"Preferences", L"Hex Editor", L"Game Genie", L"Pause / Resume"
+};
+
+void RefreshToastRebindButtonText(HWND hwnd, int index)
+{
+    HWND btn = GetDlgItem(hwnd, ID_TOAST_REBIND_BASE + index);
+    std::wstring text = g_toastListeningIndex == index ? L"Press a key..." : KeyName(*ToastBindingSlotOf(g_toastTempKeys, index));
+    SetWindowTextW(btn, text.c_str());
+}
+
+void RecomputeToastConflicts(HWND hwnd)
+{
+    for (int i = 0; i < 8; i++) g_toastConflict[i] = false;
+    for (int i = 0; i < 8; i++)
+    {
+        int vi = *ToastBindingSlotOf(g_toastTempKeys, i);
+        if (vi <= 0) continue;
+        for (int j = i + 1; j < 8; j++)
+        {
+            int vj = *ToastBindingSlotOf(g_toastTempKeys, j);
+            if (vi == vj) { g_toastConflict[i] = true; g_toastConflict[j] = true; }
+        }
+    }
+    for (int i = 0; i < 8; i++)
+        InvalidateRect(GetDlgItem(hwnd, ID_TOAST_REBIND_BASE + i), nullptr, TRUE);
+}
+
+LRESULT CALLBACK ToastConfigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg)
+    {
+    case WM_CREATE:
+    {
+        g_toastConfigHwnd = hwnd;
+        g_toastTempKeys = g_toastKeys;
+        const int rowH = 32, labelW = 130, btnW = 150, padX = 16, padY = 16;
+        for (int i = 0; i < 8; i++)
+        {
+            int y = padY + i * rowH;
+            CreateWindowW(L"STATIC", kToastActionLabels[i], WS_CHILD | WS_VISIBLE | SS_LEFT,
+                padX, y + 5, labelW, 20, hwnd, nullptr, nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_OWNERDRAW,
+                padX + labelW, y, btnW, 24, hwnd, (HMENU)(UINT_PTR)(ID_TOAST_REBIND_BASE + i), nullptr, nullptr);
+        }
+        int bottomY = padY + 8 * rowH + 8;
+        CreateWindowW(L"BUTTON", L"Save", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            padX + labelW, bottomY, 72, 26, hwnd, (HMENU)(UINT_PTR)ID_TOAST_SAVE, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            padX + labelW + 82, bottomY, 72, 26, hwnd, (HMENU)(UINT_PTR)ID_TOAST_CANCEL, nullptr, nullptr);
+
+        for (int i = 0; i < 8; i++) RefreshToastRebindButtonText(hwnd, i);
+        RecomputeToastConflicts(hwnd);
+        SetTimer(hwnd, ID_TOAST_TIMER_KEYPOLL, 40, nullptr);
+        return 0;
+    }
+
+    case WM_COMMAND:
+    {
+        int id = LOWORD(wParam);
+        if (id >= ID_TOAST_REBIND_BASE && id < ID_TOAST_REBIND_BASE + 8)
+        {
+            g_toastListeningIndex = id - ID_TOAST_REBIND_BASE;
+            for (int i = 0; i < 8; i++) RefreshToastRebindButtonText(hwnd, i);
+        }
+        else if (id == ID_TOAST_SAVE)
+        {
+            g_toastKeys = g_toastTempKeys;
+            SaveToastBindings();
+            RebuildMenuAccelerators();
+            DestroyWindow(hwnd);
+        }
+        else if (id == ID_TOAST_CANCEL)
+        {
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    }
+
+    case WM_TIMER:
+        if (wParam == ID_TOAST_TIMER_KEYPOLL && g_toastListeningIndex >= 0)
+        {
+            for (int vk = 0x08; vk <= 0xFE; vk++)
+            {
+                if (vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON) continue;
+                if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU) continue;
+                if (!(GetAsyncKeyState(vk) & 0x8000)) continue;
+
+                if (vk != VK_ESCAPE)
+                    *ToastBindingSlotOf(g_toastTempKeys, g_toastListeningIndex) = vk;
+
+                g_toastListeningIndex = -1;
+                for (int i = 0; i < 8; i++) RefreshToastRebindButtonText(hwnd, i);
+                RecomputeToastConflicts(hwnd);
+                break;
+            }
+        }
+        return 0;
+
+    case WM_DRAWITEM:
+    {
+        LPDRAWITEMSTRUCT dis = (LPDRAWITEMSTRUCT)lParam;
+        if (dis->CtlID >= ID_TOAST_REBIND_BASE && dis->CtlID < ID_TOAST_REBIND_BASE + 8)
+        {
+            int idx = dis->CtlID - ID_TOAST_REBIND_BASE;
+            bool pressed = (dis->itemState & ODS_SELECTED) != 0;
+            HBRUSH bg = CreateSolidBrush(g_toastConflict[idx] ? RGB(220, 60, 60) : GetSysColor(COLOR_BTNFACE));
+            FillRect(dis->hDC, &dis->rcItem, bg);
+            DeleteObject(bg);
+
+            DrawEdge(dis->hDC, &dis->rcItem, pressed ? EDGE_SUNKEN : EDGE_RAISED, BF_RECT);
+
+            wchar_t text[64];
+            GetWindowTextW(dis->hwndItem, text, 64);
+            SetBkMode(dis->hDC, TRANSPARENT);
+            SetTextColor(dis->hDC, g_toastConflict[idx] ? RGB(255, 255, 255) : GetSysColor(COLOR_BTNTEXT));
+            RECT rc = dis->rcItem;
+            DrawTextW(dis->hDC, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            return TRUE;
+        }
+        break;
+    }
+
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+
+    case WM_DESTROY:
+        KillTimer(hwnd, ID_TOAST_TIMER_KEYPOLL);
+        g_toastConfigHwnd = nullptr;
+        g_toastListeningIndex = -1;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+void OpenToastConfig(HWND owner)
+{
+    if (g_toastConfigHwnd)
+    {
+        SetForegroundWindow(g_toastConfigHwnd);
+        return;
+    }
+
+    static bool classRegistered = false;
+    if (!classRegistered)
+    {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(WNDCLASSEXW);
+        wc.lpfnWndProc = ToastConfigWndProc;
+        wc.hInstance = (HINSTANCE)GetWindowLongPtrW(owner, GWLP_HINSTANCE);
+        wc.lpszClassName = kToastConfigClass;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hIcon = LoadIconW(wc.hInstance, L"MAINICON");
+        if (!wc.hIcon) wc.hIcon = LoadIconW(nullptr, (LPCWSTR)IDI_APPLICATION);
+        wc.hIconSm = wc.hIcon;
+        RegisterClassExW(&wc);
+        classRegistered = true;
+    }
+
+    RECT wr{ 0, 0, 330, 340 };
+    AdjustWindowRect(&wr, WS_CAPTION | WS_SYSMENU, FALSE);
+
+    HWND hwnd = CreateWindowW(kToastConfigClass, L"Configure Toast",
+        WS_CAPTION | WS_SYSMENU,
+        CW_USEDEFAULT, CW_USEDEFAULT,
+        wr.right - wr.left, wr.bottom - wr.top,
+        owner, nullptr, (HINSTANCE)GetWindowLongPtrW(owner, GWLP_HINSTANCE), nullptr);
+
+    ShowWindow(hwnd, SW_SHOW);
 }
 
 static bool g_runInBackground = false;
@@ -704,6 +997,7 @@ bool LoadRom(HWND hwnd, const std::wstring& path)
     g_bus.Reset();
     g_cpu.Reset();
     g_bus.totalCycles = 0;
+    GameGenieClearAll();
 
     if (!g_cart.lastError.empty())
         ShowMsg(g_cart.lastError.c_str(), "Notice", MB_OK | MB_ICONWARNING);
@@ -786,6 +1080,7 @@ void PaintFrame(HWND hwnd)
 static HWND g_inputConfigHwnd = nullptr;
 static KeyBindings g_tempKeys[2];
 static int g_listeningIndex = -1;
+static bool g_inputConflict[16]{};
 static const int ID_REBIND_BASE = 100;
 static const int ID_SAVE = 200;
 static const int ID_CANCEL = 201;
@@ -796,6 +1091,25 @@ void RefreshRebindButtonText(HWND hwnd, int flatIndex)
     HWND btn = GetDlgItem(hwnd, ID_REBIND_BASE + flatIndex);
     std::wstring text = g_listeningIndex == flatIndex ? L"Press a key..." : KeyName(*BindingSlot(g_tempKeys, flatIndex));
     SetWindowTextW(btn, text.c_str());
+}
+
+void RecomputeInputConflicts(HWND hwnd)
+{
+    for (int i = 0; i < 16; i++) g_inputConflict[i] = false;
+    for (int i = 0; i < 16; i++)
+    {
+        int vi = *BindingSlot(g_tempKeys, i);
+        if (vi <= 0) continue;
+        int playerI = i / 8;
+        for (int j = i + 1; j < 16; j++)
+        {
+            if (j / 8 != playerI) continue;
+            int vj = *BindingSlot(g_tempKeys, j);
+            if (vi == vj) { g_inputConflict[i] = true; g_inputConflict[j] = true; }
+        }
+    }
+    for (int i = 0; i < 16; i++)
+        InvalidateRect(GetDlgItem(hwnd, ID_REBIND_BASE + i), nullptr, TRUE);
 }
 
 LRESULT CALLBACK InputConfigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -821,7 +1135,7 @@ LRESULT CALLBACK InputConfigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
             CreateWindowW(L"STATIC", kButtonNames[b], WS_CHILD | WS_VISIBLE | SS_LEFT,
                 padX + offsetX, y + 5, labelW, 20, hwnd, nullptr, nullptr, nullptr);
-            HWND btn = CreateWindowW(L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            HWND btn = CreateWindowW(L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_OWNERDRAW,
                 padX + labelW + offsetX, y, btnW, 24, hwnd, (HMENU)(UINT_PTR)(ID_REBIND_BASE + i), nullptr, nullptr);
             (void)btn;
         }
@@ -833,6 +1147,7 @@ LRESULT CALLBACK InputConfigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             280, bottomY, 80, 26, hwnd, (HMENU)(UINT_PTR)ID_CANCEL, nullptr, nullptr);
 
         for (int i = 0; i < 16; i++) RefreshRebindButtonText(hwnd, i);
+        RecomputeInputConflicts(hwnd);
         SetTimer(hwnd, ID_TIMER_KEYPOLL, 40, nullptr);
         return 0;
     }
@@ -874,10 +1189,35 @@ LRESULT CALLBACK InputConfigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
                 g_listeningIndex = -1;
                 for (int i = 0; i < 16; i++) RefreshRebindButtonText(hwnd, i);
+                RecomputeInputConflicts(hwnd);
                 break;
             }
         }
         return 0;
+
+    case WM_DRAWITEM:
+    {
+        LPDRAWITEMSTRUCT dis = (LPDRAWITEMSTRUCT)lParam;
+        if (dis->CtlID >= ID_REBIND_BASE && dis->CtlID < ID_REBIND_BASE + 16)
+        {
+            int idx = dis->CtlID - ID_REBIND_BASE;
+            bool pressed = (dis->itemState & ODS_SELECTED) != 0;
+            HBRUSH bg = CreateSolidBrush(g_inputConflict[idx] ? RGB(220, 60, 60) : GetSysColor(COLOR_BTNFACE));
+            FillRect(dis->hDC, &dis->rcItem, bg);
+            DeleteObject(bg);
+
+            DrawEdge(dis->hDC, &dis->rcItem, pressed ? EDGE_SUNKEN : EDGE_RAISED, BF_RECT);
+
+            wchar_t text[64];
+            GetWindowTextW(dis->hwndItem, text, 64);
+            SetBkMode(dis->hDC, TRANSPARENT);
+            SetTextColor(dis->hDC, g_inputConflict[idx] ? RGB(255, 255, 255) : GetSysColor(COLOR_BTNTEXT));
+            RECT rc = dis->rcItem;
+            DrawTextW(dis->hDC, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            return TRUE;
+        }
+        break;
+    }
 
     case WM_CLOSE:
         DestroyWindow(hwnd);
@@ -1215,10 +1555,18 @@ void LoadStateFromSlot(int slot)
         ShowMsg("This save state was made for a different ROM and cannot be loaded.", "Load State", MB_OK | MB_ICONWARNING);
         return;
     }
+
+    StateWriter backup;
+    g_bus.SaveState(backup);
+
     StateReader r(data.data(), data.size());
     g_bus.LoadState(r);
     if (!r.ok)
+    {
+        StateReader rb(backup.buf.data(), backup.buf.size());
+        g_bus.LoadState(rb);
         ShowMsg("Save state is corrupt.", "Load State", MB_OK | MB_ICONERROR);
+    }
 }
 
 void SaveStateToZipDialog(HWND hwnd)
@@ -1264,13 +1612,21 @@ void LoadStateFromZipDialog(HWND hwnd)
     }
     if (!StateBufferMatchesLoadedRom(data))
     {
-        MessageBoxA(hwnd, "This save state was made for a different ROM and cannot be loaded.", "Load State", MB_OK | MB_ICONWARNING);
+        ShowMsg("This save state was made for a different ROM and cannot be loaded.", "Load State", MB_OK | MB_ICONWARNING);
         return;
     }
+
+    StateWriter backup;
+    g_bus.SaveState(backup);
+
     StateReader r(data.data(), data.size());
     g_bus.LoadState(r);
     if (!r.ok)
+    {
+        StateReader rb(backup.buf.data(), backup.buf.size());
+        g_bus.LoadState(rb);
         ShowMsg("Save state is corrupt.", "Load State", MB_OK | MB_ICONERROR);
+    }
 }
 
 static HWND g_hexEditorHwnd = nullptr;
@@ -1538,6 +1894,250 @@ void OpenHexEditor(HWND owner)
     ShowWindow(g_hexEditorHwnd, SW_SHOW);
 }
 
+struct GgEntry
+{
+    std::wstring code;
+    bool enabled = true;
+    u16  addr = 0;
+    u8   value = 0;
+    u8   compare = 0;
+    bool hasCompare = false;
+};
+
+static std::vector<GgEntry> g_ggList;
+static HWND    g_ggHwnd = nullptr;
+static WNDPROC g_ggEditOldProc = nullptr;
+static const wchar_t* kGameGenieClass = L"NesEmuGameGenieClass";
+
+static const int ID_GG_EDIT   = 400;
+static const int ID_GG_ADD    = 401;
+static const int ID_GG_LIST   = 402;
+static const int ID_GG_TOGGLE = 403;
+static const int ID_GG_REMOVE = 404;
+static const int ID_GG_CLEAR  = 405;
+static const int ID_GG_STATUS = 406;
+
+static bool GgDecode(const std::wstring& text, GgEntry& out)
+{
+    static const wchar_t kLetters[] = L"APZLGITYEOXUKSVN";
+    int n[8] = {};
+    int len = 0;
+    std::wstring canon;
+
+    for (wchar_t ch : text)
+    {
+        if (ch == L' ' || ch == L'-') continue;
+        if (ch >= L'a' && ch <= L'z') ch = (wchar_t)(ch - L'a' + L'A');
+
+        int v = -1;
+        for (int i = 0; i < 16; i++)
+            if (kLetters[i] == ch) { v = i; break; }
+
+        if (v < 0 || len >= 8) return false;
+        n[len++] = v;
+        canon += ch;
+    }
+    if (len != 6 && len != 8) return false;
+
+    out.addr = (u16)(0x8000
+        | ((n[3] & 7) << 12)
+        | ((n[5] & 7) << 8) | ((n[4] & 8) << 8)
+        | ((n[2] & 7) << 4) | ((n[1] & 8) << 4)
+        |  (n[4] & 7)       |  (n[3] & 8));
+
+    out.value = (u8)(((n[1] & 7) << 4) | ((n[0] & 8) << 4) | (n[0] & 7)
+        | (len == 6 ? (n[5] & 8) : (n[7] & 8)));
+
+    out.hasCompare = (len == 8);
+    out.compare = 0;
+    if (len == 8)
+        out.compare = (u8)(((n[7] & 7) << 4) | ((n[6] & 8) << 4) | (n[6] & 7) | (n[5] & 8));
+
+    out.code = canon;
+    out.enabled = true;
+    return true;
+}
+
+static void GgApply()
+{
+    g_bus.gameGenie.clear();
+    for (const auto& e : g_ggList)
+        if (e.enabled)
+            g_bus.gameGenie.push_back({ e.addr, e.value, e.compare, e.hasCompare });
+}
+
+static void GgRefreshList(int select = -1)
+{
+    if (!g_ggHwnd) return;
+    HWND list = GetDlgItem(g_ggHwnd, ID_GG_LIST);
+    SendMessageW(list, LB_RESETCONTENT, 0, 0);
+
+    for (const auto& e : g_ggList)
+    {
+        wchar_t line[128];
+        if (e.hasCompare)
+            wsprintfW(line, L"[%s]  %s    %04X:%02X (if %02X)", e.enabled ? L"x" : L" ", e.code.c_str(), e.addr, e.value, e.compare);
+        else
+            wsprintfW(line, L"[%s]  %s    %04X:%02X", e.enabled ? L"x" : L" ", e.code.c_str(), e.addr, e.value);
+        SendMessageW(list, LB_ADDSTRING, 0, (LPARAM)line);
+    }
+    if (select >= 0 && select < (int)g_ggList.size())
+        SendMessageW(list, LB_SETCURSEL, select, 0);
+}
+
+void GameGenieClearAll()
+{
+    g_ggList.clear();
+    GgApply();
+    GgRefreshList();
+}
+
+static LRESULT CALLBACK GgEditProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    if (m == WM_CHAR && w == VK_RETURN)
+    {
+        PostMessageW(GetParent(h), WM_COMMAND, MAKEWPARAM(ID_GG_ADD, BN_CLICKED), 0);
+        return 0;
+    }
+    return CallWindowProcW(g_ggEditOldProc, h, m, w, l);
+}
+
+LRESULT CALLBACK GameGenieWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg)
+    {
+    case WM_CREATE:
+    {
+        g_ggHwnd = hwnd;
+		HINSTANCE hi = (HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE);
+        HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+        HWND ctl[8];
+        ctl[0] = CreateWindowW(L"STATIC", L"Code:", WS_CHILD | WS_VISIBLE, 10, 14, 40, 18, hwnd, nullptr, hi, nullptr);
+        ctl[1] = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_UPPERCASE,
+                               55, 10, 180, 24, hwnd, (HMENU)(UINT_PTR)ID_GG_EDIT, hi, nullptr);
+        ctl[2] = CreateWindowW(L"BUTTON", L"Add", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                               245, 9, 70, 26, hwnd, (HMENU)(UINT_PTR)ID_GG_ADD, hi, nullptr);
+        ctl[3] = CreateWindowW(L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+                               10, 44, 395, 200, hwnd, (HMENU)(UINT_PTR)ID_GG_LIST, hi, nullptr);
+        ctl[4] = CreateWindowW(L"BUTTON", L"Enable / Disable", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                               10, 252, 120, 26, hwnd, (HMENU)(UINT_PTR)ID_GG_TOGGLE, hi, nullptr);
+        ctl[5] = CreateWindowW(L"BUTTON", L"Remove", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                               140, 252, 80, 26, hwnd, (HMENU)(UINT_PTR)ID_GG_REMOVE, hi, nullptr);
+        ctl[6] = CreateWindowW(L"BUTTON", L"Clear All", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                               230, 252, 80, 26, hwnd, (HMENU)(UINT_PTR)ID_GG_CLEAR, hi, nullptr);
+        ctl[7] = CreateWindowW(L"STATIC", L"Enter a 6 or 8 letter code. Double-click a code to toggle it.",
+                               WS_CHILD | WS_VISIBLE, 10, 288, 395, 20, hwnd, (HMENU)(UINT_PTR)ID_GG_STATUS, hi, nullptr);
+
+        for (HWND c : ctl) SendMessageW(c, WM_SETFONT, (WPARAM)font, TRUE);
+
+        SendMessageW(ctl[1], EM_LIMITTEXT, 16, 0);
+        g_ggEditOldProc = (WNDPROC)SetWindowLongPtrW(ctl[1], GWLP_WNDPROC, (LONG_PTR)GgEditProc);
+
+        GgRefreshList();
+        SetFocus(ctl[1]);
+        return 0;
+    }
+
+    case WM_COMMAND:
+    {
+        int id = LOWORD(wParam);
+        int code = HIWORD(wParam);
+        HWND list = GetDlgItem(hwnd, ID_GG_LIST);
+
+        if (id == ID_GG_ADD)
+        {
+            wchar_t buf[64] = L"";
+            GetDlgItemTextW(hwnd, ID_GG_EDIT, buf, 64);
+
+            GgEntry e;
+            if (!GgDecode(buf, e))
+            {
+                SetDlgItemTextW(hwnd, ID_GG_STATUS, L"Invalid code. Use 6 or 8 letters from: A P Z L G I T Y E O X U K S V N");
+                return 0;
+            }
+            for (const auto& x : g_ggList)
+            {
+                if (x.code == e.code)
+                {
+                    SetDlgItemTextW(hwnd, ID_GG_STATUS, L"That code is already in the list.");
+                    return 0;
+                }
+            }
+            g_ggList.push_back(e);
+            GgApply();
+            GgRefreshList((int)g_ggList.size() - 1);
+            SetDlgItemTextW(hwnd, ID_GG_EDIT, L"");
+            SetDlgItemTextW(hwnd, ID_GG_STATUS, L"Code added.");
+            SetFocus(GetDlgItem(hwnd, ID_GG_EDIT));
+        }
+        else if (id == ID_GG_TOGGLE || (id == ID_GG_LIST && code == LBN_DBLCLK))
+        {
+            int sel = (int)SendMessageW(list, LB_GETCURSEL, 0, 0);
+            if (sel >= 0 && sel < (int)g_ggList.size())
+            {
+                g_ggList[sel].enabled = !g_ggList[sel].enabled;
+                GgApply();
+                GgRefreshList(sel);
+            }
+        }
+        else if (id == ID_GG_REMOVE)
+        {
+            int sel = (int)SendMessageW(list, LB_GETCURSEL, 0, 0);
+            if (sel >= 0 && sel < (int)g_ggList.size())
+            {
+                g_ggList.erase(g_ggList.begin() + sel);
+                GgApply();
+                GgRefreshList(sel < (int)g_ggList.size() ? sel : (int)g_ggList.size() - 1);
+                SetDlgItemTextW(hwnd, ID_GG_STATUS, L"Code removed.");
+            }
+        }
+        else if (id == ID_GG_CLEAR)
+        {
+            GameGenieClearAll();
+            SetDlgItemTextW(hwnd, ID_GG_STATUS, L"All codes cleared.");
+        }
+        return 0;
+    }
+
+    case WM_DESTROY:
+        g_ggHwnd = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+void OpenGameGenie(HWND owner)
+{
+    if (g_ggHwnd) { SetForegroundWindow(g_ggHwnd); return; }
+
+    static bool classRegistered = false;
+    if (!classRegistered)
+    {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(WNDCLASSEXW);
+        wc.lpfnWndProc = GameGenieWndProc;
+        wc.hInstance = (HINSTANCE)GetWindowLongPtrW(owner, GWLP_HINSTANCE);
+        wc.lpszClassName = kGameGenieClass;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hIcon = LoadIconW(wc.hInstance, L"MAINICON");
+        if (!wc.hIcon) wc.hIcon = LoadIconW(nullptr, (LPCWSTR)IDI_APPLICATION);
+        wc.hIconSm = wc.hIcon;
+        RegisterClassExW(&wc);
+        classRegistered = true;
+    }
+
+    RECT wr{ 0, 0, 415, 318 };
+    AdjustWindowRect(&wr, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
+    g_ggHwnd = CreateWindowW(kGameGenieClass, L"Game Genie",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        CW_USEDEFAULT, CW_USEDEFAULT,
+        wr.right - wr.left, wr.bottom - wr.top,
+        owner, nullptr, (HINSTANCE)GetWindowLongPtrW(owner, GWLP_HINSTANCE), nullptr);
+    ShowWindow(g_ggHwnd, SW_SHOW);
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg)
@@ -1564,61 +2164,57 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     }
 
     case WM_KEYDOWN:
-    if (wParam == 'R' && g_romLoaded)
+    if (wParam == (WPARAM)g_toastKeys.Reset && g_romLoaded && (GetKeyState(VK_CONTROL) & 0x8000))
     {
         g_bus.Reset();
         g_cpu.Reset();
     }
-    else if (wParam == 'O' && (GetKeyState(VK_CONTROL) & 0x8000))
+    else if (wParam == (WPARAM)g_toastKeys.OpenRom && (GetKeyState(VK_CONTROL) & 0x8000))
     {
         OpenFileDialog(hwnd);
     }
-    else if (wParam == 'I' && (GetKeyState(VK_CONTROL) & 0x8000))
+    else if (wParam == (WPARAM)g_toastKeys.InputConfig && (GetKeyState(VK_CONTROL) & 0x8000))
     {
         OpenInputConfig(hwnd);
     }
-    else if (wParam == 'P' && (GetKeyState(VK_CONTROL) & 0x8000))
+    else if (wParam == (WPARAM)g_toastKeys.ToastConfig && (GetKeyState(VK_CONTROL) & 0x8000))
+    {
+        OpenToastConfig(hwnd);
+    }
+    else if (wParam == (WPARAM)g_toastKeys.Options && (GetKeyState(VK_CONTROL) & 0x8000))
     {
         OpenOptions(hwnd);
     }
-    else if (wParam == 'H' && (GetKeyState(VK_CONTROL) & 0x8000))
+    else if (wParam == (WPARAM)g_toastKeys.HexEditor && (GetKeyState(VK_CONTROL) & 0x8000))
     {
         OpenHexEditor(hwnd);
     }
-    else if (wParam == VK_F8 && g_romLoaded)
+    else if (wParam == (WPARAM)g_toastKeys.GameGenie && (GetKeyState(VK_CONTROL) & 0x8000))
+    {
+        OpenGameGenie(hwnd);
+    }
+    else if (wParam == (WPARAM)g_toastKeys.PauseResume && g_romLoaded && (GetKeyState(VK_CONTROL) & 0x8000))
     {
         g_running = !g_running;
     }
-    else if (wParam == VK_F9 && g_romLoaded)
-{
-    FILE* f = fopen("nes_debug.txt", "w");
-    if (f)
-    {
-        g_bus.ppu.DebugDump(f);
-        g_cart.DebugDumpMapper(f);
-        g_bus.ppu.DebugDumpNametable(f);
-        g_cpu.DebugDump(f);
-        g_bus.ppu.DebugDumpPatternTiles(f);
-        g_bus.ppu.DebugDumpUsedTiles(f);
-        fclose(f);
-        ShowMsg("Saved nes_debug.txt next to the exe.", "Debug Dump", MB_OK);
-    }
-}
+    return 0;
 
     case WM_COMMAND:
     {
         int id = LOWORD(wParam);
         if (id == ID_FILE_OPEN) OpenFileDialog(hwnd);
         else if (id == ID_INPUT_CONFIG) OpenInputConfig(hwnd);
+        else if (id == ID_TOAST_CONFIG) OpenToastConfig(hwnd);
         else if (id == ID_OPTIONS) OpenOptions(hwnd);
         else if (id == ID_HEX_EDITOR) OpenHexEditor(hwnd);
+        else if (id == ID_GAME_GENIE) OpenGameGenie(hwnd);
         else if (id == ID_SAVE_STATE_ZIP) SaveStateToZipDialog(hwnd);
         else if (id == ID_LOAD_STATE_ZIP) LoadStateFromZipDialog(hwnd);
         else if (id >= ID_SAVE_SLOT_BASE && id < ID_SAVE_SLOT_BASE + 9) SaveStateToSlot(id - ID_SAVE_SLOT_BASE);
         else if (id >= ID_LOAD_SLOT_BASE && id < ID_LOAD_SLOT_BASE + 9) LoadStateFromSlot(id - ID_LOAD_SLOT_BASE);
         return 0;
     }
-    
+
     case WM_SYSCOMMAND:
     if ((wParam & 0xFFF0) == SC_KEYMENU) return 0;
     break;
@@ -1664,7 +2260,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 
     HMENU menuBar = CreateMenu();
     HMENU fileMenu = CreatePopupMenu();
-    AppendMenuW(fileMenu, MF_STRING, ID_FILE_OPEN, L"Open ROM...\tCtrl+O");
+    g_fileMenu = fileMenu;
+    AppendMenuW(fileMenu, MF_STRING, ID_FILE_OPEN, L"Open ROM...");
     AppendMenuW(fileMenu, MF_SEPARATOR, 0, nullptr);
 
     HMENU saveStateMenu = CreatePopupMenu();
@@ -1692,15 +2289,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     AppendMenuW(menuBar, MF_POPUP, (UINT_PTR)fileMenu, L"File");
 
     HMENU inputMenu = CreatePopupMenu();
-    AppendMenuW(inputMenu, MF_STRING, ID_INPUT_CONFIG, L"Configure Controls...\tCtrl+I");
+    g_inputMenu = inputMenu;
+    AppendMenuW(inputMenu, MF_STRING, ID_INPUT_CONFIG, L"Configure NES...");
+    AppendMenuW(inputMenu, MF_STRING, ID_TOAST_CONFIG, L"Configure Toast...");
     AppendMenuW(menuBar, MF_POPUP, (UINT_PTR)inputMenu, L"Input");
 
     HMENU optionsMenu = CreatePopupMenu();
-    AppendMenuW(optionsMenu, MF_STRING, ID_OPTIONS, L"Preferences...\tCtrl+P");
+    g_optionsMenu = optionsMenu;
+    AppendMenuW(optionsMenu, MF_STRING, ID_OPTIONS, L"Preferences...");
     AppendMenuW(menuBar, MF_POPUP, (UINT_PTR)optionsMenu, L"Options");
 
     HMENU toolsMenu = CreatePopupMenu();
-    AppendMenuW(toolsMenu, MF_STRING, ID_HEX_EDITOR, L"Hex Editor...\tCtrl+H");
+    g_toolsMenu = toolsMenu;
+    AppendMenuW(toolsMenu, MF_STRING, ID_HEX_EDITOR, L"Hex Editor...");
+    AppendMenuW(toolsMenu, MF_STRING, ID_GAME_GENIE, L"Game Genie...");
     AppendMenuW(menuBar, MF_POPUP, (UINT_PTR)toolsMenu, L"Tools");
 
     RECT wr{ 0, 0, kNesW * g_scale, kNesH * g_scale };
@@ -1711,7 +2313,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     CW_USEDEFAULT, CW_USEDEFAULT,
     wr.right - wr.left, wr.bottom - wr.top,
     nullptr, menuBar, hInstance, nullptr);
-    
+
     g_mainHwnd = hwnd;
 
     ShowWindow(hwnd, nCmdShow);
@@ -1724,6 +2326,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     SetDiscordMenu();
 
     LoadKeyBindings();
+    LoadToastBindings();
+    RebuildMenuAccelerators();
 
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);

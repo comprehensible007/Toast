@@ -5,6 +5,7 @@
 #include "apu2A03.h"
 #include "SaveStateIO.h"
 #include <array>
+#include <vector>
 
 class Cpu6502;
 
@@ -32,6 +33,14 @@ public:
 
     Cpu6502* cpu = nullptr;
     long long totalCycles = 0;
+    struct GameGenieCode
+    {
+    	u16 addr;
+    	u8 value;
+    	u8 compare;
+    	bool hasCompare;
+    };
+    std::vector<GameGenieCode> gameGenie;
 
 private:
     std::array<u8, 2048> ram{};
@@ -41,4 +50,5 @@ private:
     u8 dmaPage = 0;
     u8 dmaAddr = 0;
     u8 dmaData = 0;
+    long long dmaStallCount = 0;
 };
