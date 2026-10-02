@@ -1,6 +1,4 @@
-# Toast
-Mostly working NES emulator
-_________________________________________________________________________________________________
+## Toast (Mostly working NES emulator)
 
 <p><small>To compile, please use Dev-C++ and click Tools > Compiler and add the following to the compiler:</small></p>
 
