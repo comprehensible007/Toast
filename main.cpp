@@ -438,7 +438,7 @@ LRESULT CALLBACK ToastConfigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     }
 
     case WM_TIMER:
-        if (wParam == ID_TOAST_TIMER_KEYPOLL && g_toastListeningIndex >= 0)
+        if (wParam == ID_TOAST_TIMER_KEYPOLL && g_toastListeningIndex >= 0 && GetForegroundWindow() == hwnd)
         {
             for (int vk = 0x08; vk <= 0xFE; vk++)
             {
@@ -840,6 +840,33 @@ static bool GetDefaultDeviceId(IMMDeviceEnumerator* enumr, std::wstring& outId)
     return true;
 }
 
+struct AudioFader
+{
+    float gain = 0.0f;
+    float held = 0.0f;
+
+    static float RampStep() { return 1.0f / (float)(Apu2A03::kSampleRate * 0.010); }
+
+    int16_t Process(bool hasData, int16_t sample)
+    {
+        const float step = RampStep();
+        if (hasData)
+        {
+            held = (float)sample;
+            gain += step;
+            if (gain > 1.0f) gain = 1.0f;
+        }
+        else
+        {
+            gain -= step;
+            if (gain < 0.0f) gain = 0.0f;
+        }
+        if (gain >= 1.0f && hasData) return sample;
+        float shaped = gain * gain * (3.0f - 2.0f * gain);
+        return (int16_t)(held * shaped);
+    }
+};
+
 DWORD WINAPI AudioThreadProc(LPVOID)
 {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -890,6 +917,7 @@ DWORD WINAPI AudioThreadProc(LPVOID)
 
         client->Start();
 
+        AudioFader fader;
         DWORD lastDeviceCheck = GetTickCount();
 
         for (;;)
@@ -913,19 +941,16 @@ DWORD WINAPI AudioThreadProc(LPVOID)
             if (FAILED(renderClient->GetBuffer(framesAvailable, &data))) break;
 
             int16_t* out = (int16_t*)data;
-            static int16_t lastSample = 0;
             for (UINT32 i = 0; i < framesAvailable; i++)
             {
                 size_t r = g_bus.apu.ringRead.load(std::memory_order_relaxed);
                 if (r == g_bus.apu.ringWrite.load(std::memory_order_acquire))
                 {
-                    lastSample = (int16_t)(lastSample * 0.9);
-                    out[i] = lastSample;
+                    out[i] = fader.Process(false, 0);
                 }
                 else
                 {
-                    lastSample = g_bus.apu.ringBuffer[r];
-                    out[i] = lastSample;
+                    out[i] = fader.Process(true, g_bus.apu.ringBuffer[r]);
                     g_bus.apu.ringRead.store((r + 1) & (Apu2A03::kRingSize - 1), std::memory_order_release);
                 }
             }
@@ -1025,9 +1050,23 @@ void OpenFileDialog(HWND hwnd)
     }
 }
 
+static bool ToastWindowIsFocused()
+{
+    HWND foreground = GetForegroundWindow();
+    return foreground != nullptr && foreground == g_mainHwnd;
+}
+
 void PollInput()
 {
     if (!g_romLoaded) return;
+
+    if (!ToastWindowIsFocused())
+    {
+        g_bus.controllerState[0] = 0;
+        g_bus.controllerState[1] = 0;
+        return;
+    }
+
     for (int p = 0; p < 2; p++)
     {
         u8 s = 0;
@@ -1130,10 +1169,8 @@ void RecomputeInputConflicts(HWND hwnd)
     {
         int vi = *BindingSlot(g_tempKeys, i);
         if (vi <= 0) continue;
-        int playerI = i / 8;
         for (int j = i + 1; j < 16; j++)
         {
-            if (j / 8 != playerI) continue;
             int vj = *BindingSlot(g_tempKeys, j);
             if (vi == vj) { g_inputConflict[i] = true; g_inputConflict[j] = true; }
         }
@@ -1189,7 +1226,7 @@ LRESULT CALLBACK InputConfigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     }
 
     case WM_TIMER:
-        if (wParam == ID_TIMER_KEYPOLL && g_listeningIndex >= 0)
+        if (wParam == ID_TIMER_KEYPOLL && g_listeningIndex >= 0 && GetForegroundWindow() == hwnd)
         {
             for (int vk = 0x08; vk <= 0xFE; vk++)
             {
