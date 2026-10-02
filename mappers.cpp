@@ -1,4 +1,8 @@
 #include "mappers.h"
+#include "mappers_extra.h"
+#include "mappers_extra2.h"
+#include "mappers_extra3.h"
+#include <cmath>
 
 class Mapper0 : public Mapper
 {
@@ -388,12 +392,6 @@ class Mapper4 : public Mapper
     bool irqEnabled = false;
     bool irqPending = false;
 
-    bool tracing = false;
-    int traceWritesLeft = 0;
-    FILE* traceFile = nullptr;
-    bool irqTraceArm = false;
-    int irqTraceLeft = 0;
-
     u32 PrgOffset(int slot) const
     {
         u32 banks = Prg8kCount() ? Prg8kCount() : 1;
@@ -459,20 +457,15 @@ public:
         {
             if (even) bankSelect = data;
             else R[bankSelect & 0x07] = data;
-
-            if (tracing && traceWritesLeft > 0 && traceFile)
-            {
-                fprintf(traceFile, "%s addr=%04X data=%02X -> target=%d\n",
-                        even ? "SELECT" : "DATA  ", addr, data, bankSelect & 0x07);
-                fflush(traceFile);
-                traceWritesLeft--;
-                if (traceWritesLeft == 0) { fclose(traceFile); traceFile = nullptr; tracing = false; }
-            }
         }
         else if (addr < 0xC000)
         {
 
-            if (even) mirroring = (data & 1) ? Mirroring::HORIZONTAL : Mirroring::VERTICAL;
+            if (even)
+            {
+                if (headerMirroring != Mirroring::FOUR_SCREEN)
+                    mirroring = (data & 1) ? Mirroring::HORIZONTAL : Mirroring::VERTICAL;
+            }
             else
             {
                 prgRamWriteProtect = (data & 0x40) != 0;
@@ -526,26 +519,10 @@ public:
         {
             irqPending = true;
         }
-
-        if (irqTraceArm && irqTraceLeft > 0)
-        {
-            irqTraceLeft--;
-            if (irqTraceLeft == 0) irqTraceArm = false;
-        }
     }
 
     bool IRQState() const override { return irqPending; }
     void IRQClear() override { irqPending = false; }
-    void ArmIrqTrace(int count) override { irqTraceArm = true; irqTraceLeft = count; }
-
-    void SetTracing(bool on) override
-    {
-        tracing = on;
-        if (on)
-        {
-            traceWritesLeft = 64;
-        }
-    }
 
     void SaveState(StateWriter& w) const override
     {
@@ -830,8 +807,68 @@ class Mapper24 : public Mapper
     bool irqEnabled = false, irqAckEnable = false, irqModeCycle = false, irqPending = false;
     int irqPrescaler = 0;
 
+    struct V6Pulse { u8 ctrl = 0; u16 freq = 0; bool enable = false; u16 timer = 0; u8 step = 0; };
+    struct V6Saw   { u8 rate = 0; u16 freq = 0; bool enable = false; u16 timer = 0; u8 phase = 0; u8 acc = 0; };
+    V6Pulse v6p[2];
+    V6Saw v6s;
+    bool v6Halt = false;
+    int v6Shift = 0;
+
+    bool WriteAudio(u16 reg, u8 data)
+    {
+        switch (reg)
+        {
+        case 0x9000: v6p[0].ctrl = data; return true;
+        case 0x9001: v6p[0].freq = (u16)((v6p[0].freq & 0xF00) | data); return true;
+        case 0x9002: v6p[0].freq = (u16)((v6p[0].freq & 0x0FF) | ((data & 0x0F) << 8)); v6p[0].enable = (data & 0x80) != 0; if (!v6p[0].enable) v6p[0].step = 0; return true;
+        case 0x9003: v6Halt = (data & 1) != 0; v6Shift = (data & 4) ? 8 : (data & 2) ? 4 : 0; return true;
+        case 0xA000: v6p[1].ctrl = data; return true;
+        case 0xA001: v6p[1].freq = (u16)((v6p[1].freq & 0xF00) | data); return true;
+        case 0xA002: v6p[1].freq = (u16)((v6p[1].freq & 0x0FF) | ((data & 0x0F) << 8)); v6p[1].enable = (data & 0x80) != 0; if (!v6p[1].enable) v6p[1].step = 0; return true;
+        case 0xB000: v6s.rate = data & 0x3F; return true;
+        case 0xB001: v6s.freq = (u16)((v6s.freq & 0xF00) | data); return true;
+        case 0xB002: v6s.freq = (u16)((v6s.freq & 0x0FF) | ((data & 0x0F) << 8)); v6s.enable = (data & 0x80) != 0; if (!v6s.enable) { v6s.phase = 0; v6s.acc = 0; } return true;
+        default: return false;
+        }
+    }
+
+    void ClockAudio()
+    {
+        if (v6Halt) return;
+        for (int i = 0; i < 2; i++)
+        {
+            V6Pulse& p = v6p[i];
+            if (!p.enable) continue;
+            if (p.timer == 0) { p.timer = (u16)(p.freq >> v6Shift); p.step = (u8)((p.step + 1) & 15); }
+            else p.timer--;
+        }
+        if (v6s.enable)
+        {
+            if (v6s.timer == 0)
+            {
+                v6s.timer = (u16)(v6s.freq >> v6Shift);
+                v6s.phase = (u8)((v6s.phase + 1) % 14);
+                if (v6s.phase == 0) v6s.acc = 0;
+                else if ((v6s.phase & 1) == 0) v6s.acc = (u8)(v6s.acc + v6s.rate);
+            }
+            else v6s.timer--;
+        }
+    }
+
 public:
     using Mapper::Mapper;
+
+    double ExpansionAudio() override
+    {
+        int out = 0;
+        for (int i = 0; i < 2; i++)
+        {
+            const V6Pulse& p = v6p[i];
+            if (p.enable && ((p.ctrl & 0x80) || p.step <= ((p.ctrl >> 4) & 7))) out += p.ctrl & 0x0F;
+        }
+        if (v6s.enable) out += v6s.acc >> 3;
+        return out * 0.0085;
+    }
 
     bool CpuRead(u16 addr, u8& data) override
     {
@@ -862,14 +899,14 @@ public:
 
         u16 reg = addr & 0xF003;
 
-        if (addr >= 0x8000 && addr <= 0x8003) { prg16kBank = data & 0x0F; return true; }
-        if (addr >= 0xC000 && addr <= 0xC003) { prg8kBank = data & 0x1F; return true; }
+        if (reg >= 0x8000 && reg <= 0x8003) { prg16kBank = data & 0x0F; return true; }
+        if (reg >= 0xC000 && reg <= 0xC003) { prg8kBank = data & 0x1F; return true; }
 
-        if (addr >= 0x9000 && addr <= 0xB002) return true;
+        if (reg >= 0x9000 && reg <= 0xB002) { WriteAudio(reg, data); return true; }
 
         if (reg == 0xB003)
         {
-            switch (data & 0x03)
+            switch ((data >> 2) & 0x03)
             {
             case 0: mirroring = Mirroring::VERTICAL; break;
             case 1: mirroring = Mirroring::HORIZONTAL; break;
@@ -880,11 +917,11 @@ public:
             return true;
         }
 
-        if (addr >= 0xD000 && addr <= 0xD003) { chrBank[addr - 0xD000] = data; return true; }
-        if (addr >= 0xE000 && addr <= 0xE003) { chrBank[4 + (addr - 0xE000)] = data; return true; }
+        if (reg >= 0xD000 && reg <= 0xD003) { chrBank[reg - 0xD000] = data; return true; }
+        if (reg >= 0xE000 && reg <= 0xE003) { chrBank[4 + (reg - 0xE000)] = data; return true; }
 
-        if (addr == 0xF000) { irqLatch = data; return true; }
-        if (addr == 0xF001)
+        if (reg == 0xF000) { irqLatch = data; return true; }
+        if (reg == 0xF001)
         {
             irqEnabled = (data & 0x02) != 0;
             irqAckEnable = (data & 0x01) != 0;
@@ -893,7 +930,7 @@ public:
             irqPending = false;
             return true;
         }
-        if (addr == 0xF002)
+        if (reg == 0xF002)
         {
             irqPending = false;
             irqEnabled = irqAckEnable;
@@ -924,6 +961,7 @@ public:
 
     void ClockCpuCycle() override
     {
+        ClockAudio();
         if (!irqEnabled) return;
 
         if (irqModeCycle)
@@ -932,7 +970,7 @@ public:
         }
         else
         {
-            irqPrescaler += 1;
+            irqPrescaler += 3;
             if (irqPrescaler >= 341)
             {
                 irqPrescaler -= 341;
@@ -976,6 +1014,19 @@ public:
         irqLatch = r.U8(); irqCounter = r.U8();
         irqEnabled = r.Bool(); irqAckEnable = r.Bool(); irqModeCycle = r.Bool(); irqPending = r.Bool();
         irqPrescaler = (int)r.S64();
+    }
+};
+
+class Mapper26 : public Mapper24
+{
+public:
+    using Mapper24::Mapper24;
+
+    bool CpuWrite(u16 addr, u8 data) override
+    {
+        if (addr >= 0x8000)
+            addr = (u16)((addr & 0xFFFC) | ((addr & 1) << 1) | ((addr >> 1) & 1));
+        return Mapper24::CpuWrite(addr, data);
     }
 };
 
@@ -1032,8 +1083,30 @@ class Mapper69 : public Mapper
     u16 irqCounter = 0xFFFF;
     bool irqPending = false;
 
+    u8 ayReg[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    u8 aySel = 0;
+    u16 ayCnt[3] = { 0, 0, 0 };
+    u8 ayOut[3] = { 0, 0, 0 };
+    int ayDiv = 0;
+
 public:
     using Mapper::Mapper;
+
+    double ExpansionAudio() override
+    {
+        static double tbl[16];
+        static bool init = false;
+        if (!init) { tbl[0] = 0.0; for (int v = 1; v < 16; v++) tbl[v] = std::pow(2.0, (v - 15) / 2.0); init = true; }
+        double s = 0.0;
+        for (int ch = 0; ch < 3; ch++)
+        {
+            int vol = ayReg[8 + ch] & 0x0F;
+            bool toneOn = !(ayReg[7] & (1 << ch));
+            int out = toneOn ? ayOut[ch] : 1;
+            s += tbl[vol] * out;
+        }
+        return s * 0.07;
+    }
 
     bool CpuRead(u16 addr, u8& data) override
     {
@@ -1104,6 +1177,8 @@ public:
             }
             return true;
         }
+        if (addr < 0xE000) aySel = data & 0x0F;
+        else ayReg[aySel] = data;
         return true;
     }
 
@@ -1129,6 +1204,16 @@ public:
 
     void ClockCpuCycle() override
     {
+        if (++ayDiv >= 16)
+        {
+            ayDiv = 0;
+            for (int ch = 0; ch < 3; ch++)
+            {
+                u16 p = (u16)(ayReg[ch * 2] | ((ayReg[ch * 2 + 1] & 0x0F) << 8));
+                if (p == 0) p = 1;
+                if (++ayCnt[ch] >= p) { ayCnt[ch] = 0; ayOut[ch] ^= 1; }
+            }
+        }
         if (!irqCountEnabled) return;
         if (irqCounter == 0)
         {
@@ -1522,8 +1607,9 @@ public:
 };
 
 std::unique_ptr<Mapper> CreateMapper(int mapperID, std::vector<u8> prg, std::vector<u8> chr,
-                                      bool chrIsRAM, Mirroring headerMirroring)
+                                      bool chrIsRAM, Mirroring headerMirroring, int submapper)
 {
+    if (mapperID == 13 && chr.size() < 16384) chr.resize(16384, 0);
     switch (mapperID)
     {
     case 0:   return std::unique_ptr<Mapper>(new Mapper0(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
@@ -1542,8 +1628,53 @@ std::unique_ptr<Mapper> CreateMapper(int mapperID, std::vector<u8> prg, std::vec
     case 69:  return std::unique_ptr<Mapper>(new Mapper69(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
     case 71:  return std::unique_ptr<Mapper>(new Mapper71(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
     case 75:  return std::unique_ptr<Mapper>(new Mapper75(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
-    case 79:  return std::unique_ptr<Mapper>(new Mapper79(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
-    case 113: return std::unique_ptr<Mapper>(new Mapper113(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 79:  return std::unique_ptr<Mapper>(new Nina(false, std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 113: return std::unique_ptr<Mapper>(new Nina(true, std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+
+    case 16:
+    case 159: return std::unique_ptr<Mapper>(new BandaiFcg(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 18:  return std::unique_ptr<Mapper>(new JalecoSs88006(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 21: case 22: case 23: case 25:
+              return std::unique_ptr<Mapper>(new Vrc24(mapperID, std::move(prg), std::move(chr), chrIsRAM, headerMirroring, submapper));
+    case 26:  return std::unique_ptr<Mapper>(new Mapper26(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 30:  return std::unique_ptr<Mapper>(new Unrom512(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 32:  return std::unique_ptr<Mapper>(new IremG101(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 33:  return std::unique_ptr<Mapper>(new TaitoTc(false, std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 48:  return std::unique_ptr<Mapper>(new TaitoTc(true, std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 65:  return std::unique_ptr<Mapper>(new IremH3001(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 67:  return std::unique_ptr<Mapper>(new Sunsoft3(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 68:  return std::unique_ptr<Mapper>(new Sunsoft4(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 73:  return std::unique_ptr<Mapper>(new Vrc3(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 70: case 72: case 78: case 86: case 87: case 89: case 92: case 93: case 94: case 97: case 185: case 232:
+              return std::unique_ptr<Mapper>(new SimpleLatch(mapperID, std::move(prg), std::move(chr), chrIsRAM, headerMirroring, submapper));
+    case 76: case 88: case 95: case 154: case 206:
+              return std::unique_ptr<Mapper>(new NamcoDx(mapperID, std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 80:  return std::unique_ptr<Mapper>(new TaitoX1005(false, std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 207: return std::unique_ptr<Mapper>(new TaitoX1005(true, std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 118: case 119:
+              return std::unique_ptr<Mapper>(new Mmc3Variant(mapperID, std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 155: return std::unique_ptr<Mapper>(new Mapper1(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+
+    case 31:  return std::unique_ptr<Mapper>(new Mapper31(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 38: case 41: case 42: case 46: case 50: case 91: case 107: case 112: case 133: case 143: case 145:
+    case 148: case 149: case 156: case 200: case 201: case 202: case 203: case 212: case 225: case 255:
+    case 228: case 229: case 240: case 241: case 242: case 244: case 246:
+              return std::unique_ptr<Mapper>(new MultiLatch(mapperID, std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 146: return std::unique_ptr<Mapper>(new Nina(false, std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 74: case 189: case 191: case 192: case 194: case 195: case 198: case 47: case 44: case 205:
+              return std::unique_ptr<Mapper>(new Mmc3Gen(mapperID, std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 96:  return std::unique_ptr<Mapper>(new OekaKids(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 90: case 209: case 211:
+              return std::unique_ptr<Mapper>(new JyCompany(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+
+    case 5:   return std::unique_ptr<Mapper>(new Mmc5(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 19:  return std::unique_ptr<Mapper>(new Namco163(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 40:  return std::unique_ptr<Mapper>(new Mapper40(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 64:  return std::unique_ptr<Mapper>(new Rambo1(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 82:  return std::unique_ptr<Mapper>(new TaitoX1017(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 85:  return std::unique_ptr<Mapper>(new Vrc7(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
+    case 153: return std::unique_ptr<Mapper>(new BandaiFcg(std::move(prg), std::move(chr), chrIsRAM, headerMirroring, true));
+    case 210: return std::unique_ptr<Mapper>(new Namco210(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
     case 140: return std::unique_ptr<Mapper>(new Mapper140(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
     case 152: return std::unique_ptr<Mapper>(new Mapper152(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));
     case 180: return std::unique_ptr<Mapper>(new Mapper180(std::move(prg), std::move(chr), chrIsRAM, headerMirroring));

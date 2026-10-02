@@ -20,6 +20,9 @@ void Cpu6502::Reset()
     sp = 0xFD;
     status = 0x00 | U | I;
 
+    nmiPending = false; nmiSampled = false;
+    irqSampled = false; irqLine = false;
+
     addrRel = 0; addrAbs = 0; fetched = 0;
     cyclesRemaining = 8;
 }
@@ -27,13 +30,12 @@ void Cpu6502::Reset()
 void Cpu6502::IRQ()
 {
     if (GetFlag(I)) return;
-    if (irqSourceTraceArm);
     Write(0x0100 + sp, (pc >> 8) & 0xFF); sp--;
     Write(0x0100 + sp, pc & 0xFF); sp--;
     SetFlag(B, false);
     SetFlag(U, true);
-    SetFlag(I, true);
     Write(0x0100 + sp, status); sp--;
+    SetFlag(I, true);
 
     addrAbs = 0xFFFE;
     u16 lo = Read(addrAbs);
@@ -48,8 +50,8 @@ void Cpu6502::NMI()
     Write(0x0100 + sp, pc & 0xFF); sp--;
     SetFlag(B, false);
     SetFlag(U, true);
-    SetFlag(I, true);
     Write(0x0100 + sp, status); sp--;
+    SetFlag(I, true);
 
     addrAbs = 0xFFFA;
     u16 lo = Read(addrAbs);
@@ -81,9 +83,6 @@ void Cpu6502::Clock()
         }
         else
         {
-            if (pc == lastFetchedPc) samePcStreak++;
-            else { lastFetchedPc = pc; samePcStreak = 0; }
-
             opcode = Read(pc);
             pc++;
             SetFlag(U, true);
@@ -330,12 +329,12 @@ u8 Cpu6502::RTS()
 u8 Cpu6502::BRK()
 {
     pc++;
-    SetFlag(I, true);
     Write(0x0100 + sp, (pc >> 8) & 0xFF); sp--;
     Write(0x0100 + sp, pc & 0xFF); sp--;
     SetFlag(B, true);
     Write(0x0100 + sp, status); sp--;
     SetFlag(B, false);
+    SetFlag(I, true);
 
     pc = (u16)Read(0xFFFE) | ((u16)Read(0xFFFF) << 8);
     return 0;
@@ -374,6 +373,183 @@ u8 Cpu6502::PLP() { sp++; status = Read(0x0100 + sp); SetFlag(U, true); SetFlag(
 
 u8 Cpu6502::NOP() { return 1; }
 u8 Cpu6502::XXX() { return 0; }
+
+void Cpu6502::AddWithCarry(u8 value)
+{
+    u16 tmp = (u16)a + (u16)value + (u16)GetFlag(C);
+    SetFlag(C, tmp > 255);
+    SetFlag(Z, (tmp & 0x00FF) == 0);
+    SetFlag(V, (~((u16)a ^ (u16)value) & ((u16)a ^ tmp)) & 0x0080);
+    SetFlag(N, tmp & 0x80);
+    a = tmp & 0xFF;
+}
+
+u8 Cpu6502::LAX()
+{
+    Fetch();
+    a = x = fetched;
+    SetFlag(Z, a == 0); SetFlag(N, a & 0x80);
+    return 1;
+}
+
+u8 Cpu6502::SAX() { Write(addrAbs, a & x); return 0; }
+
+u8 Cpu6502::SLO()
+{
+    Fetch();
+    SetFlag(C, fetched & 0x80);
+    u8 v = (u8)(fetched << 1);
+    Write(addrAbs, v);
+    a |= v;
+    SetFlag(Z, a == 0); SetFlag(N, a & 0x80);
+    return 0;
+}
+
+u8 Cpu6502::RLA()
+{
+    Fetch();
+    u8 v = (u8)((fetched << 1) | GetFlag(C));
+    SetFlag(C, fetched & 0x80);
+    Write(addrAbs, v);
+    a &= v;
+    SetFlag(Z, a == 0); SetFlag(N, a & 0x80);
+    return 0;
+}
+
+u8 Cpu6502::SRE()
+{
+    Fetch();
+    SetFlag(C, fetched & 0x01);
+    u8 v = (u8)(fetched >> 1);
+    Write(addrAbs, v);
+    a ^= v;
+    SetFlag(Z, a == 0); SetFlag(N, a & 0x80);
+    return 0;
+}
+
+u8 Cpu6502::RRA()
+{
+    Fetch();
+    u8 v = (u8)((GetFlag(C) << 7) | (fetched >> 1));
+    SetFlag(C, fetched & 0x01);
+    Write(addrAbs, v);
+    AddWithCarry(v);
+    return 0;
+}
+
+u8 Cpu6502::DCP()
+{
+    Fetch();
+    u8 v = (u8)(fetched - 1);
+    Write(addrAbs, v);
+    SetFlag(C, a >= v);
+    SetFlag(Z, a == v);
+    SetFlag(N, (u8)(a - v) & 0x80);
+    return 0;
+}
+
+u8 Cpu6502::ISB()
+{
+    Fetch();
+    u8 v = (u8)(fetched + 1);
+    Write(addrAbs, v);
+    AddWithCarry((u8)~v);
+    return 0;
+}
+
+u8 Cpu6502::ANC()
+{
+    Fetch();
+    a &= fetched;
+    SetFlag(Z, a == 0); SetFlag(N, a & 0x80);
+    SetFlag(C, a & 0x80);
+    return 0;
+}
+
+u8 Cpu6502::ALR()
+{
+    Fetch();
+    a &= fetched;
+    SetFlag(C, a & 0x01);
+    a >>= 1;
+    SetFlag(Z, a == 0); SetFlag(N, a & 0x80);
+    return 0;
+}
+
+u8 Cpu6502::ARR()
+{
+    Fetch();
+    a &= fetched;
+    a = (u8)((GetFlag(C) << 7) | (a >> 1));
+    SetFlag(Z, a == 0); SetFlag(N, a & 0x80);
+    SetFlag(C, a & 0x40);
+    SetFlag(V, ((a >> 6) ^ (a >> 5)) & 0x01);
+    return 0;
+}
+
+u8 Cpu6502::AXS()
+{
+    Fetch();
+    u8 t = a & x;
+    SetFlag(C, t >= fetched);
+    x = (u8)(t - fetched);
+    SetFlag(Z, x == 0); SetFlag(N, x & 0x80);
+    return 0;
+}
+
+u8 Cpu6502::LAS()
+{
+    Fetch();
+    u8 v = fetched & sp;
+    a = x = sp = v;
+    SetFlag(Z, v == 0); SetFlag(N, v & 0x80);
+    return 1;
+}
+
+u8 Cpu6502::XAA()
+{
+    Fetch();
+    a = (u8)((a | 0xEE) & x & fetched);
+    SetFlag(Z, a == 0); SetFlag(N, a & 0x80);
+    return 0;
+}
+
+u8 Cpu6502::LXA()
+{
+    Fetch();
+    a = x = (u8)((a | 0xEE) & fetched);
+    SetFlag(Z, a == 0); SetFlag(N, a & 0x80);
+    return 0;
+}
+
+u8 Cpu6502::TAS()
+{
+    sp = a & x;
+    u8 hi = (u8)(((u16)(addrAbs - y)) >> 8);
+    Write(addrAbs, (u8)(sp & (hi + 1)));
+    return 0;
+}
+
+u8 Cpu6502::SHY()
+{
+    u8 hi = (u8)(((u16)(addrAbs - x)) >> 8);
+    Write(addrAbs, (u8)(y & (hi + 1)));
+    return 0;
+}
+
+u8 Cpu6502::SHX()
+{
+    u8 hi = (u8)(((u16)(addrAbs - y)) >> 8);
+    Write(addrAbs, (u8)(x & (hi + 1)));
+    return 0;
+}
+
+u8 Cpu6502::SHA()
+{
+    u8 hi = (u8)(((u16)(addrAbs - y)) >> 8);
+    Write(addrAbs, (u8)(a & x & (hi + 1)));
+    return 0;
+}
 
 void Cpu6502::BuildTable()
 {
@@ -491,6 +667,53 @@ void Cpu6502::BuildTable()
     for (u8 op : nopAbs) set(op,&Cpu6502::NOP,&Cpu6502::ABS,4);
     const u8 nopAbx[]  = {0x1C,0x3C,0x5C,0x7C,0xDC,0xFC};
     for (u8 op : nopAbx) set(op,&Cpu6502::NOP,&Cpu6502::ABX,4);
+
+    set(0xEB,&Cpu6502::SBC,&Cpu6502::IMM,2);
+
+    set(0x0B,&Cpu6502::ANC,&Cpu6502::IMM,2); set(0x2B,&Cpu6502::ANC,&Cpu6502::IMM,2);
+    set(0x4B,&Cpu6502::ALR,&Cpu6502::IMM,2); set(0x6B,&Cpu6502::ARR,&Cpu6502::IMM,2);
+    set(0x8B,&Cpu6502::XAA,&Cpu6502::IMM,2); set(0xAB,&Cpu6502::LXA,&Cpu6502::IMM,2);
+    set(0xCB,&Cpu6502::AXS,&Cpu6502::IMM,2); set(0xBB,&Cpu6502::LAS,&Cpu6502::ABY,4);
+    set(0x9B,&Cpu6502::TAS,&Cpu6502::ABY,5); set(0x9C,&Cpu6502::SHY,&Cpu6502::ABX,5);
+    set(0x9E,&Cpu6502::SHX,&Cpu6502::ABY,5); set(0x9F,&Cpu6502::SHA,&Cpu6502::ABY,5);
+    set(0x93,&Cpu6502::SHA,&Cpu6502::IZY,6);
+
+    set(0xA3,&Cpu6502::LAX,&Cpu6502::IZX,6); set(0xA7,&Cpu6502::LAX,&Cpu6502::ZP0,3);
+    set(0xAF,&Cpu6502::LAX,&Cpu6502::ABS,4); set(0xB3,&Cpu6502::LAX,&Cpu6502::IZY,5);
+    set(0xB7,&Cpu6502::LAX,&Cpu6502::ZPY,4); set(0xBF,&Cpu6502::LAX,&Cpu6502::ABY,4);
+
+    set(0x83,&Cpu6502::SAX,&Cpu6502::IZX,6); set(0x87,&Cpu6502::SAX,&Cpu6502::ZP0,3);
+    set(0x8F,&Cpu6502::SAX,&Cpu6502::ABS,4); set(0x97,&Cpu6502::SAX,&Cpu6502::ZPY,4);
+
+    set(0x03,&Cpu6502::SLO,&Cpu6502::IZX,8); set(0x07,&Cpu6502::SLO,&Cpu6502::ZP0,5);
+    set(0x0F,&Cpu6502::SLO,&Cpu6502::ABS,6); set(0x13,&Cpu6502::SLO,&Cpu6502::IZY,8);
+    set(0x17,&Cpu6502::SLO,&Cpu6502::ZPX,6); set(0x1B,&Cpu6502::SLO,&Cpu6502::ABY,7);
+    set(0x1F,&Cpu6502::SLO,&Cpu6502::ABX,7);
+
+    set(0x23,&Cpu6502::RLA,&Cpu6502::IZX,8); set(0x27,&Cpu6502::RLA,&Cpu6502::ZP0,5);
+    set(0x2F,&Cpu6502::RLA,&Cpu6502::ABS,6); set(0x33,&Cpu6502::RLA,&Cpu6502::IZY,8);
+    set(0x37,&Cpu6502::RLA,&Cpu6502::ZPX,6); set(0x3B,&Cpu6502::RLA,&Cpu6502::ABY,7);
+    set(0x3F,&Cpu6502::RLA,&Cpu6502::ABX,7);
+
+    set(0x43,&Cpu6502::SRE,&Cpu6502::IZX,8); set(0x47,&Cpu6502::SRE,&Cpu6502::ZP0,5);
+    set(0x4F,&Cpu6502::SRE,&Cpu6502::ABS,6); set(0x53,&Cpu6502::SRE,&Cpu6502::IZY,8);
+    set(0x57,&Cpu6502::SRE,&Cpu6502::ZPX,6); set(0x5B,&Cpu6502::SRE,&Cpu6502::ABY,7);
+    set(0x5F,&Cpu6502::SRE,&Cpu6502::ABX,7);
+
+    set(0x63,&Cpu6502::RRA,&Cpu6502::IZX,8); set(0x67,&Cpu6502::RRA,&Cpu6502::ZP0,5);
+    set(0x6F,&Cpu6502::RRA,&Cpu6502::ABS,6); set(0x73,&Cpu6502::RRA,&Cpu6502::IZY,8);
+    set(0x77,&Cpu6502::RRA,&Cpu6502::ZPX,6); set(0x7B,&Cpu6502::RRA,&Cpu6502::ABY,7);
+    set(0x7F,&Cpu6502::RRA,&Cpu6502::ABX,7);
+
+    set(0xC3,&Cpu6502::DCP,&Cpu6502::IZX,8); set(0xC7,&Cpu6502::DCP,&Cpu6502::ZP0,5);
+    set(0xCF,&Cpu6502::DCP,&Cpu6502::ABS,6); set(0xD3,&Cpu6502::DCP,&Cpu6502::IZY,8);
+    set(0xD7,&Cpu6502::DCP,&Cpu6502::ZPX,6); set(0xDB,&Cpu6502::DCP,&Cpu6502::ABY,7);
+    set(0xDF,&Cpu6502::DCP,&Cpu6502::ABX,7);
+
+    set(0xE3,&Cpu6502::ISB,&Cpu6502::IZX,8); set(0xE7,&Cpu6502::ISB,&Cpu6502::ZP0,5);
+    set(0xEF,&Cpu6502::ISB,&Cpu6502::ABS,6); set(0xF3,&Cpu6502::ISB,&Cpu6502::IZY,8);
+    set(0xF7,&Cpu6502::ISB,&Cpu6502::ZPX,6); set(0xFB,&Cpu6502::ISB,&Cpu6502::ABY,7);
+    set(0xFF,&Cpu6502::ISB,&Cpu6502::ABX,7);
 }
 
 void Cpu6502::SaveState(StateWriter& w) const

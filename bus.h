@@ -46,9 +46,7 @@ private:
     std::array<u8, 2048> ram{};
     bool dmaInProgress = false;
     bool dmaWaitAlign = true;
-    bool dmaLoggedThisSession = false;
     u8 dmaPage = 0;
     u8 dmaAddr = 0;
     u8 dmaData = 0;
-    long long dmaStallCount = 0;
 };

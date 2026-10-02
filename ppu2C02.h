@@ -30,6 +30,8 @@ public:
     
     int GetScanline() const { return scanline; }
     int GetCycle() const { return cycle; }
+    bool LeftColumnHidden() const { return (mask & 0x18) && !(mask & 0x02) && !(mask & 0x04); }
+
 
 private:
     struct SpriteEntry
@@ -39,7 +41,7 @@ private:
 
     Cartridge* cart = nullptr;
 
-    u8 nameTable[2][1024]{};
+    u8 nameTable[4][1024]{};
     u8 paletteRAM[32]{};
 
     u8 ctrl = 0;
@@ -72,6 +74,7 @@ private:
     u8 prevA12 = 0;
     long long globalDotCounter = 0;
     long long lowStartDot = 0;
+
 
     u32 palette[64];
     void InitPaletteTable();

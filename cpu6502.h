@@ -35,7 +35,6 @@ public:
     bool InstructionComplete() const { return cyclesRemaining == 0; }
     bool irqSampled = false;
     bool nmiSampled = false;
-    bool irqSourceTraceArm = false;
 
     u8 fetched = 0;
     u16 addrAbs = 0;
@@ -71,9 +70,10 @@ private:
     u8 ROR(); u8 RTI(); u8 RTS(); u8 SBC(); u8 SEC(); u8 SED(); u8 SEI(); u8 STA();
     u8 STX(); u8 STY(); u8 TAX(); u8 TAY(); u8 TSX(); u8 TXA(); u8 TXS(); u8 TYA();
     u8 XXX();
-    
-    u16 lastFetchedPc = 0xFFFF;
-    long long samePcStreak = 0;
+    u8 LAX(); u8 SAX(); u8 DCP(); u8 ISB(); u8 SLO(); u8 SRE(); u8 RLA(); u8 RRA();
+    u8 ANC(); u8 ALR(); u8 ARR(); u8 AXS(); u8 LAS(); u8 XAA(); u8 LXA();
+    u8 TAS(); u8 SHY(); u8 SHX(); u8 SHA();
+    void AddWithCarry(u8 value);
 
     struct Instruction
     {

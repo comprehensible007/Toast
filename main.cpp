@@ -8,6 +8,7 @@
 #include <commdlg.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <commctrl.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 
@@ -38,6 +39,9 @@ static const wchar_t* kWindowClass = L"NesEmuWindowClass";
 static const wchar_t* kInputConfigClass = L"NesEmuInputConfigClass";
 static const int kNesW = 256, kNesH = 240;
 static int g_scale = 3;
+static bool g_videoSmooth = false;
+static bool g_videoKeepAspect = false;
+static bool g_videoCropOverscan = true;
 
 enum : UINT_PTR
 {
@@ -368,8 +372,6 @@ static ToastBindings g_toastTempKeys;
 static int g_toastListeningIndex = -1;
 static bool g_toastConflict[8]{};
 static const int ID_TOAST_REBIND_BASE = 500;
-static const int ID_TOAST_SAVE = 600;
-static const int ID_TOAST_CANCEL = 601;
 static const int ID_TOAST_TIMER_KEYPOLL = 3;
 static const wchar_t* kToastConfigClass = L"NesEmuToastConfigClass";
 static const wchar_t* kToastActionLabels[8] = {
@@ -418,12 +420,6 @@ LRESULT CALLBACK ToastConfigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             CreateWindowW(L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_OWNERDRAW,
                 padX + labelW, y, btnW, 24, hwnd, (HMENU)(UINT_PTR)(ID_TOAST_REBIND_BASE + i), nullptr, nullptr);
         }
-        int bottomY = padY + 8 * rowH + 8;
-        CreateWindowW(L"BUTTON", L"Save", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            padX + labelW, bottomY, 72, 26, hwnd, (HMENU)(UINT_PTR)ID_TOAST_SAVE, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            padX + labelW + 82, bottomY, 72, 26, hwnd, (HMENU)(UINT_PTR)ID_TOAST_CANCEL, nullptr, nullptr);
-
         for (int i = 0; i < 8; i++) RefreshToastRebindButtonText(hwnd, i);
         RecomputeToastConflicts(hwnd);
         SetTimer(hwnd, ID_TOAST_TIMER_KEYPOLL, 40, nullptr);
@@ -438,17 +434,6 @@ LRESULT CALLBACK ToastConfigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             g_toastListeningIndex = id - ID_TOAST_REBIND_BASE;
             for (int i = 0; i < 8; i++) RefreshToastRebindButtonText(hwnd, i);
         }
-        else if (id == ID_TOAST_SAVE)
-        {
-            g_toastKeys = g_toastTempKeys;
-            SaveToastBindings();
-            RebuildMenuAccelerators();
-            DestroyWindow(hwnd);
-        }
-        else if (id == ID_TOAST_CANCEL)
-        {
-            DestroyWindow(hwnd);
-        }
         return 0;
     }
 
@@ -462,7 +447,12 @@ LRESULT CALLBACK ToastConfigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 if (!(GetAsyncKeyState(vk) & 0x8000)) continue;
 
                 if (vk != VK_ESCAPE)
+                {
                     *ToastBindingSlotOf(g_toastTempKeys, g_toastListeningIndex) = vk;
+                    g_toastKeys = g_toastTempKeys;
+                    SaveToastBindings();
+                    RebuildMenuAccelerators();
+                }
 
                 g_toastListeningIndex = -1;
                 for (int i = 0; i < 8; i++) RefreshToastRebindButtonText(hwnd, i);
@@ -534,7 +524,7 @@ void OpenToastConfig(HWND owner)
         classRegistered = true;
     }
 
-    RECT wr{ 0, 0, 330, 340 };
+    RECT wr{ 0, 0, 330, 288 };
     AdjustWindowRect(&wr, WS_CAPTION | WS_SYSMENU, FALSE);
 
     HWND hwnd = CreateWindowW(kToastConfigClass, L"Configure Toast",
@@ -561,6 +551,9 @@ void SaveOptions()
     f << L"Scale=" << g_scale << L"\n";
     f << L"Discord=" << (g_discordEnabled ? 1 : 0) << L"\n";
     f << L"Background=" << (g_runInBackground ? 1 : 0) << L"\n";
+    f << L"Smooth=" << (g_videoSmooth ? 1 : 0) << L"\n";
+    f << L"KeepAspect=" << (g_videoKeepAspect ? 1 : 0) << L"\n";
+    f << L"CropOverscan=" << (g_videoCropOverscan ? 1 : 0) << L"\n";
 }
 
 void LoadOptions()
@@ -577,6 +570,9 @@ void LoadOptions()
         if (name == L"Scale" && val >= 1 && val <= 5) g_scale = val;
         else if (name == L"Discord") g_discordEnabled = (val != 0);
         else if (name == L"Background") g_runInBackground = (val != 0);
+        else if (name == L"Smooth") g_videoSmooth = (val != 0);
+        else if (name == L"KeepAspect") g_videoKeepAspect = (val != 0);
+        else if (name == L"CropOverscan") g_videoCropOverscan = (val != 0);
     }
 }
 
@@ -1047,6 +1043,8 @@ void PollInput()
     }
 }
 
+static bool g_cropEdges = false;
+
 void RunOneFrame()
 {
     if (!g_running) return;
@@ -1058,6 +1056,8 @@ void RunOneFrame()
     }
     for (int i = 0; i < kNesW * kNesH; i++)
         g_frameBuf[i] = g_bus.ppu.screen[i];
+
+    g_cropEdges = g_bus.ppu.LeftColumnHidden();
 }
 
 void PaintFrame(HWND hwnd)
@@ -1067,10 +1067,42 @@ void PaintFrame(HWND hwnd)
     int destW = rc.right - rc.left;
     int destH = rc.bottom - rc.top;
 
-    SetStretchBltMode(hdc, COLORONCOLOR);
+    bool crop = g_cropEdges && g_videoCropOverscan;
+    int cropX = crop ? 8 : 0;
+    int cropTop = crop ? 8 : 0;
+    int cropBottom = crop ? 7 : 0;
+    int srcW = kNesW - 2 * cropX;
+    int srcH = kNesH - cropTop - cropBottom;
+
+    int dx = 0, dy = 0, dw = destW, dh = destH;
+    if (g_videoKeepAspect && destW > 0 && destH > 0)
+    {
+        double sx = (double)destW / srcW, sy = (double)destH / srcH;
+        double s = sx < sy ? sx : sy;
+        dw = (int)(srcW * s);
+        dh = (int)(srcH * s);
+        dx = (destW - dw) / 2;
+        dy = (destH - dh) / 2;
+
+        HBRUSH black = (HBRUSH)GetStockObject(BLACK_BRUSH);
+        RECT bars[4] = { { 0, 0, destW, dy }, { 0, dy + dh, destW, destH }, { 0, dy, dx, dy + dh }, { dx + dw, dy, destW, dy + dh } };
+        for (int i = 0; i < 4; i++)
+            if (bars[i].right > bars[i].left && bars[i].bottom > bars[i].top) FillRect(hdc, &bars[i], black);
+    }
+
+    if (g_videoSmooth)
+    {
+        SetStretchBltMode(hdc, HALFTONE);
+        SetBrushOrgEx(hdc, 0, 0, nullptr);
+    }
+    else
+    {
+        SetStretchBltMode(hdc, COLORONCOLOR);
+    }
+
     StretchDIBits(hdc,
-        0, 0, destW, destH,
-        0, 0, kNesW, kNesH,
+        dx, dy, dw, dh,
+        cropX, cropTop, srcW, srcH,
         g_frameBuf.data(), &g_bmi,
         DIB_RGB_COLORS, SRCCOPY);
 
@@ -1082,8 +1114,6 @@ static KeyBindings g_tempKeys[2];
 static int g_listeningIndex = -1;
 static bool g_inputConflict[16]{};
 static const int ID_REBIND_BASE = 100;
-static const int ID_SAVE = 200;
-static const int ID_CANCEL = 201;
 static const int ID_TIMER_KEYPOLL = 1;
 
 void RefreshRebindButtonText(HWND hwnd, int flatIndex)
@@ -1140,12 +1170,6 @@ LRESULT CALLBACK InputConfigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             (void)btn;
         }
 
-        int bottomY = padY + 8 * rowH + 8;
-        CreateWindowW(L"BUTTON", L"Save", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            180, bottomY, 80, 26, hwnd, (HMENU)(UINT_PTR)ID_SAVE, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            280, bottomY, 80, 26, hwnd, (HMENU)(UINT_PTR)ID_CANCEL, nullptr, nullptr);
-
         for (int i = 0; i < 16; i++) RefreshRebindButtonText(hwnd, i);
         RecomputeInputConflicts(hwnd);
         SetTimer(hwnd, ID_TIMER_KEYPOLL, 40, nullptr);
@@ -1161,17 +1185,6 @@ LRESULT CALLBACK InputConfigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             SetFocus(hwnd);
             for (int i = 0; i < 16; i++) RefreshRebindButtonText(hwnd, i);
         }
-        else if (id == ID_SAVE)
-        {
-            g_keys[0] = g_tempKeys[0];
-            g_keys[1] = g_tempKeys[1];
-            SaveKeyBindings();
-            DestroyWindow(hwnd);
-        }
-        else if (id == ID_CANCEL)
-        {
-            DestroyWindow(hwnd);
-        }
         return 0;
     }
 
@@ -1185,7 +1198,12 @@ LRESULT CALLBACK InputConfigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 if (!(GetAsyncKeyState(vk) & 0x8000)) continue;
 
                 if (vk != VK_ESCAPE)
+                {
                     *BindingSlot(g_tempKeys, g_listeningIndex) = vk;
+                    g_keys[0] = g_tempKeys[0];
+                    g_keys[1] = g_tempKeys[1];
+                    SaveKeyBindings();
+                }
 
                 g_listeningIndex = -1;
                 for (int i = 0; i < 16; i++) RefreshRebindButtonText(hwnd, i);
@@ -1257,7 +1275,7 @@ void OpenInputConfig(HWND owner)
         classRegistered = true;
     }
 
-    RECT wr{ 0, 0, 540, 360 };
+    RECT wr{ 0, 0, 540, 300 };
     AdjustWindowRect(&wr, WS_CAPTION | WS_SYSMENU, FALSE);
 
     g_inputConfigHwnd = CreateWindowW(kInputConfigClass, L"Configure Controls",
@@ -1274,8 +1292,55 @@ static const wchar_t* kOptionsClass = L"NesEmuOptionsClass";
 static const int ID_OPT_SCALE_BASE = 400;
 static const int ID_OPT_DISCORD = 410;
 static const int ID_OPT_BACKGROUND = 411;
-static const int ID_OPT_SAVE = 412;
-static const int ID_OPT_CANCEL = 413;
+static const int ID_OPT_VIDEO_LABEL = 413;
+static const int ID_OPT_SMOOTH = 414;
+static const int ID_OPT_ASPECT = 415;
+static const int ID_OPT_CROP = 416;
+static const int ID_OPT_TAB = 420;
+
+static void EnsureTabControlClass()
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+    HMODULE lib = LoadLibraryW(L"comctl32.dll");
+    if (!lib) return;
+    typedef BOOL (WINAPI *InitCommonControlsExFn)(const INITCOMMONCONTROLSEX*);
+    InitCommonControlsExFn init = (InitCommonControlsExFn)GetProcAddress(lib, "InitCommonControlsEx");
+    if (init)
+    {
+        INITCOMMONCONTROLSEX icc;
+        icc.dwSize = sizeof(icc);
+        icc.dwICC = ICC_TAB_CLASSES;
+        init(&icc);
+    }
+}
+
+static void ApplyWindowScale(HWND prefsHwnd)
+{
+    HWND owner = GetWindow(prefsHwnd, GW_OWNER);
+    if (!owner) return;
+    RECT wr{ 0, 0, kNesW * g_scale, kNesH * g_scale };
+    AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, TRUE);
+    SetWindowPos(owner, nullptr, 0, 0, wr.right - wr.left, wr.bottom - wr.top, SWP_NOMOVE | SWP_NOZORDER);
+}
+
+static void ShowPreferencesTab(HWND hwnd, int tab)
+{
+    const int generalIds[] = { ID_OPT_DISCORD, ID_OPT_BACKGROUND };
+    for (size_t i = 0; i < sizeof(generalIds) / sizeof(generalIds[0]); i++)
+        ShowWindow(GetDlgItem(hwnd, generalIds[i]), tab == 0 ? SW_SHOW : SW_HIDE);
+
+    int videoIds[] = { ID_OPT_VIDEO_LABEL, ID_OPT_SMOOTH, ID_OPT_ASPECT, ID_OPT_CROP,
+                       ID_OPT_SCALE_BASE, ID_OPT_SCALE_BASE + 1, ID_OPT_SCALE_BASE + 2, ID_OPT_SCALE_BASE + 3, ID_OPT_SCALE_BASE + 4 };
+    for (size_t i = 0; i < sizeof(videoIds) / sizeof(videoIds[0]); i++)
+        ShowWindow(GetDlgItem(hwnd, videoIds[i]), tab == 1 ? SW_SHOW : SW_HIDE);
+}
+
+static bool IsChecked(HWND hwnd, int id)
+{
+    return SendMessageW(GetDlgItem(hwnd, id), BM_GETCHECK, 0, 0) == BST_CHECKED;
+}
 
 LRESULT CALLBACK OptionsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -1283,59 +1348,95 @@ LRESULT CALLBACK OptionsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     {
     case WM_CREATE:
     {
-        CreateWindowW(L"STATIC", L"Window Size", WS_CHILD | WS_VISIBLE, 16, 12, 120, 20, hwnd, nullptr, nullptr, nullptr);
-        const wchar_t* labels[5] = { L"1x", L"2x", L"3x", L"4x", L"5x" };
-        for (int i = 0; i < 5; i++)
+        EnsureTabControlClass();
+
+        HWND tab = CreateWindowExW(0, L"SysTabControl32", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_FOCUSNEVER,
+            8, 8, 384, 28, hwnd, (HMENU)(UINT_PTR)ID_OPT_TAB, nullptr, nullptr);
+        const wchar_t* tabNames[2] = { L"General", L"Video" };
+        for (int i = 0; i < 2; i++)
         {
-            DWORD style = WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | (i == 0 ? WS_GROUP : 0);
-            HWND rb = CreateWindowW(L"BUTTON", labels[i], style, 16 + i * 60, 36, 56, 22, hwnd, (HMENU)(UINT_PTR)(ID_OPT_SCALE_BASE + i), nullptr, nullptr);
-            if (g_scale == i + 1) SendMessageW(rb, BM_SETCHECK, BST_CHECKED, 0);
+            TCITEMW item{};
+            item.mask = TCIF_TEXT;
+            item.pszText = (LPWSTR)tabNames[i];
+            SendMessageW(tab, TCM_INSERTITEMW, (WPARAM)i, (LPARAM)&item);
         }
 
         HWND discordCb = CreateWindowW(L"BUTTON", L"Enable Discord Rich Presence", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-            16, 72, 280, 22, hwnd, (HMENU)(UINT_PTR)ID_OPT_DISCORD, nullptr, nullptr);
+            20, 56, 360, 22, hwnd, (HMENU)(UINT_PTR)ID_OPT_DISCORD, nullptr, nullptr);
         SendMessageW(discordCb, BM_SETCHECK, g_discordEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
 
         HWND bgCb = CreateWindowW(L"BUTTON", L"Continue emulating when window is not focused", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-            16, 100, 300, 22, hwnd, (HMENU)(UINT_PTR)ID_OPT_BACKGROUND, nullptr, nullptr);
+            20, 84, 360, 22, hwnd, (HMENU)(UINT_PTR)ID_OPT_BACKGROUND, nullptr, nullptr);
         SendMessageW(bgCb, BM_SETCHECK, g_runInBackground ? BST_CHECKED : BST_UNCHECKED, 0);
 
-        CreateWindowW(L"BUTTON", L"Save", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 100, 140, 80, 26, hwnd, (HMENU)(UINT_PTR)ID_OPT_SAVE, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 200, 140, 80, 26, hwnd, (HMENU)(UINT_PTR)ID_OPT_CANCEL, nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Window Size", WS_CHILD, 20, 52, 120, 20, hwnd, (HMENU)(UINT_PTR)ID_OPT_VIDEO_LABEL, nullptr, nullptr);
+        const wchar_t* labels[5] = { L"1x", L"2x", L"3x", L"4x", L"5x" };
+        for (int i = 0; i < 5; i++)
+        {
+            DWORD style = WS_CHILD | BS_AUTORADIOBUTTON | (i == 0 ? WS_GROUP : 0);
+            HWND rb = CreateWindowW(L"BUTTON", labels[i], style, 20 + i * 62, 76, 58, 22, hwnd, (HMENU)(UINT_PTR)(ID_OPT_SCALE_BASE + i), nullptr, nullptr);
+            if (g_scale == i + 1) SendMessageW(rb, BM_SETCHECK, BST_CHECKED, 0);
+        }
+
+        HWND smoothCb = CreateWindowW(L"BUTTON", L"Smooth scaling", WS_CHILD | BS_AUTOCHECKBOX,
+            20, 110, 360, 22, hwnd, (HMENU)(UINT_PTR)ID_OPT_SMOOTH, nullptr, nullptr);
+        SendMessageW(smoothCb, BM_SETCHECK, g_videoSmooth ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        HWND aspectCb = CreateWindowW(L"BUTTON", L"Keep aspect ratio when resizing", WS_CHILD | BS_AUTOCHECKBOX,
+            20, 136, 360, 22, hwnd, (HMENU)(UINT_PTR)ID_OPT_ASPECT, nullptr, nullptr);
+        SendMessageW(aspectCb, BM_SETCHECK, g_videoKeepAspect ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        HWND cropCb = CreateWindowW(L"BUTTON", L"Crop hidden edges", WS_CHILD | BS_AUTOCHECKBOX,
+            20, 162, 360, 22, hwnd, (HMENU)(UINT_PTR)ID_OPT_CROP, nullptr, nullptr);
+        SendMessageW(cropCb, BM_SETCHECK, g_videoCropOverscan ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        ShowPreferencesTab(hwnd, 0);
+        return 0;
+    }
+
+    case WM_NOTIFY:
+    {
+        NMHDR* nm = (NMHDR*)lParam;
+        if (nm && nm->idFrom == ID_OPT_TAB && nm->code == TCN_SELCHANGE)
+        {
+            int sel = (int)SendMessageW(nm->hwndFrom, TCM_GETCURSEL, 0, 0);
+            ShowPreferencesTab(hwnd, sel);
+        }
         return 0;
     }
 
     case WM_COMMAND:
-        if (LOWORD(wParam) == ID_OPT_SAVE)
-        {
-            for (int i = 0; i < 5; i++)
-            {
-                HWND rb = GetDlgItem(hwnd, ID_OPT_SCALE_BASE + i);
-                if (SendMessageW(rb, BM_GETCHECK, 0, 0) == BST_CHECKED)
-                {
-                    g_scale = i + 1;
-                }
-            }
-            g_discordEnabled = SendMessageW(GetDlgItem(hwnd, ID_OPT_DISCORD), BM_GETCHECK, 0, 0) == BST_CHECKED;
-            g_runInBackground = SendMessageW(GetDlgItem(hwnd, ID_OPT_BACKGROUND), BM_GETCHECK, 0, 0) == BST_CHECKED;
+    {
+        if (HIWORD(wParam) != BN_CLICKED) return 0;
+        int id = LOWORD(wParam);
+        HWND owner = GetWindow(hwnd, GW_OWNER);
 
+        if (id >= ID_OPT_SCALE_BASE && id < ID_OPT_SCALE_BASE + 5)
+        {
+            g_scale = id - ID_OPT_SCALE_BASE + 1;
             SaveOptions();
-
-            HWND owner = GetWindow(hwnd, GW_OWNER);
-            if (owner)
-            {
-                RECT wr{ 0, 0, kNesW * g_scale, kNesH * g_scale };
-                AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, TRUE);
-                SetWindowPos(owner, nullptr, 0, 0, wr.right - wr.left, wr.bottom - wr.top, SWP_NOMOVE | SWP_NOZORDER);
-            }
-
-            DestroyWindow(hwnd);
+            ApplyWindowScale(hwnd);
         }
-        else if (LOWORD(wParam) == ID_OPT_CANCEL)
+        else if (id == ID_OPT_DISCORD)
         {
-            DestroyWindow(hwnd);
+            g_discordEnabled = IsChecked(hwnd, ID_OPT_DISCORD);
+            SaveOptions();
+        }
+        else if (id == ID_OPT_BACKGROUND)
+        {
+            g_runInBackground = IsChecked(hwnd, ID_OPT_BACKGROUND);
+            SaveOptions();
+        }
+        else if (id == ID_OPT_SMOOTH || id == ID_OPT_ASPECT || id == ID_OPT_CROP)
+        {
+            g_videoSmooth = IsChecked(hwnd, ID_OPT_SMOOTH);
+            g_videoKeepAspect = IsChecked(hwnd, ID_OPT_ASPECT);
+            g_videoCropOverscan = IsChecked(hwnd, ID_OPT_CROP);
+            SaveOptions();
+            if (owner) InvalidateRect(owner, nullptr, FALSE);
         }
         return 0;
+    }
 
     case WM_CLOSE:
         DestroyWindow(hwnd);
@@ -1369,9 +1470,9 @@ void OpenOptions(HWND owner)
         classRegistered = true;
     }
 
-    RECT wr{ 0, 0, 340, 210 };
+    RECT wr{ 0, 0, 400, 200 };
     AdjustWindowRect(&wr, WS_CAPTION | WS_SYSMENU, FALSE);
-    g_optionsHwnd = CreateWindowW(kOptionsClass, L"Options",
+    g_optionsHwnd = CreateWindowW(kOptionsClass, L"Preferences",
         WS_CAPTION | WS_SYSMENU,
         CW_USEDEFAULT, CW_USEDEFAULT,
         wr.right - wr.left, wr.bottom - wr.top,
@@ -1469,36 +1570,97 @@ static bool WriteZipStored(const std::wstring& path, const std::string& entryNam
     f.write((char*)&centralOffset, 4);
     f.write((char*)&zipCommentLen, 2);
 
+    f.flush();
+    return f.good();
+}
+
+static u16 Rd16(const u8* p) { return (u16)(p[0] | (p[1] << 8)); }
+static u32 Rd32(const u8* p) { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
+
+static bool ReadZipStoredFirstEntry(const std::wstring& path, std::vector<u8>& outData,
+                                    const char** error = nullptr, bool* notFound = nullptr)
+{
+    const char* dummy = nullptr;
+    if (!error) error = &dummy;
+    if (notFound) *notFound = false;
+    outData.clear();
+
+    std::ifstream f(NarrowPath(path).c_str(), std::ios::binary);
+    if (!f.is_open()) { if (notFound) *notFound = true; *error = "the file could not be opened"; return false; }
+
+    f.seekg(0, std::ios::end);
+    std::streamoff fileSize = f.tellg();
+    f.seekg(0, std::ios::beg);
+    if (fileSize < 30 + 22) { *error = "the file is too small to be a save state (truncated?)"; return false; }
+    if (fileSize > (std::streamoff)(256u * 1024u * 1024u)) { *error = "the file is too large to be a save state"; return false; }
+
+    std::vector<u8> file((size_t)fileSize);
+    f.read((char*)file.data(), (std::streamsize)file.size());
+    if ((std::streamoff)f.gcount() != fileSize) { *error = "the file could not be read completely"; return false; }
+
+    const u8* d = file.data();
+    size_t n = file.size();
+
+    if (Rd32(d) != 0x04034b50) { *error = "this is not a Toast save state (bad zip header)"; return false; }
+    u16 flags = Rd16(d + 6), method = Rd16(d + 8);
+    u32 crc = Rd32(d + 14), compSize = Rd32(d + 18), uncompSize = Rd32(d + 22);
+    u16 nameLen = Rd16(d + 26), extraLen = Rd16(d + 28);
+    if (flags & 0x0001) { *error = "encrypted zip files are not supported"; return false; }
+    if (flags & 0x0008) { *error = "zip uses a data descriptor, which Toast save states never do"; return false; }
+    if (method != 0)    { *error = "the zip is compressed; Toast save states are stored uncompressed"; return false; }
+    if (compSize != uncompSize) { *error = "entry sizes do not match (corrupted)"; return false; }
+
+    size_t dataStart = 30 + (size_t)nameLen + (size_t)extraLen;
+    if (dataStart > n || (size_t)compSize > n - dataStart) { *error = "the file is truncated (entry data is incomplete)"; return false; }
+    size_t dataEnd = dataStart + compSize;
+
+    size_t eocd = std::string::npos;
+    size_t searchFrom = (n > 22 + 65535) ? n - (22 + 65535) : 0;
+    for (size_t i = n - 22 + 1; i-- > searchFrom; )
+    {
+        if (Rd32(d + i) == 0x06054b50) { eocd = i; break; }
+    }
+    if (eocd == std::string::npos || eocd < dataEnd) { *error = "the end of the zip is missing (truncated?)"; return false; }
+    u16 entries = Rd16(d + eocd + 10);
+    u32 cdSize = Rd32(d + eocd + 12), cdOffset = Rd32(d + eocd + 16);
+    if (entries < 1) { *error = "the zip contains no entries"; return false; }
+    if (cdOffset < dataEnd || (size_t)cdOffset > n || (size_t)cdSize > n - (size_t)cdOffset || cdSize < 46)
+    { *error = "the zip directory is damaged"; return false; }
+
+    const u8* c = d + cdOffset;
+    if (Rd32(c) != 0x02014b50) { *error = "the zip directory is damaged"; return false; }
+    if (Rd32(c + 16) != crc || Rd32(c + 20) != compSize || Rd32(c + 24) != uncompSize || Rd32(c + 42) != 0)
+    { *error = "the zip directory does not match the saved data (corrupted)"; return false; }
+
+    if (Crc32(d + dataStart, compSize) != crc) { *error = "the data failed its CRC check (the file is corrupted)"; return false; }
+
+    outData.assign(d + dataStart, d + dataEnd);
     return true;
 }
 
-static bool ReadZipStoredFirstEntry(const std::wstring& path, std::vector<u8>& outData)
+static bool SaveZipVerified(const std::wstring& path, const std::vector<u8>& data, const char** error)
 {
-    std::ifstream f(NarrowPath(path).c_str(), std::ios::binary);
-    if (!f.is_open()) return false;
-
-    u32 sig = 0;
-    f.read((char*)&sig, 4);
-    if (sig != 0x04034b50) return false;
-
-    u16 version, flags, method, modTime, modDate, nameLen, extraLen;
-    u32 crc, compSize, uncompSize;
-    f.read((char*)&version, 2);
-    f.read((char*)&flags, 2);
-    f.read((char*)&method, 2);
-    f.read((char*)&modTime, 2);
-    f.read((char*)&modDate, 2);
-    f.read((char*)&crc, 4);
-    f.read((char*)&compSize, 4);
-    f.read((char*)&uncompSize, 4);
-    f.read((char*)&nameLen, 2);
-    f.read((char*)&extraLen, 2);
-    f.seekg(nameLen + extraLen, std::ios::cur);
-
-    if (method != 0) return false;
-
-    outData.resize(compSize);
-    if (compSize > 0) f.read((char*)outData.data(), compSize);
+    std::wstring tmp = path + L".tmp";
+    if (!WriteZipStored(tmp, "state.bin", data))
+    {
+        DeleteFileA(NarrowPath(tmp).c_str());
+        *error = "the file could not be written (disk full or no permission?)";
+        return false;
+    }
+    std::vector<u8> check;
+    const char* why = nullptr;
+    if (!ReadZipStoredFirstEntry(tmp, check, &why) || check != data)
+    {
+        DeleteFileA(NarrowPath(tmp).c_str());
+        *error = "the saved file failed verification, so the old file was kept";
+        return false;
+    }
+    if (!MoveFileExA(NarrowPath(tmp).c_str(), NarrowPath(path).c_str(), MOVEFILE_REPLACE_EXISTING))
+    {
+        DeleteFileA(NarrowPath(tmp).c_str());
+        *error = "the existing file could not be replaced";
+        return false;
+    }
     return true;
 }
 
@@ -1532,24 +1694,20 @@ bool StateBufferMatchesLoadedRom(const std::vector<u8>& data)
     return g_cart.IsLoaded() && savedCrc == g_cart.GetRomCrc();
 }
 
-void SaveStateToSlot(int slot)
+static void SaveStateToPath(const std::wstring& path)
 {
-    if (!g_romLoaded) return;
     StateWriter w;
     g_bus.SaveState(w);
-    if (!WriteZipStored(GetStateFilePath(slot), "state.bin", w.buf))
-        ShowMsg("Failed to save state.", "Save State", MB_OK | MB_ICONERROR);
+    const char* why = nullptr;
+    if (!SaveZipVerified(path, w.buf, &why))
+    {
+        std::string msg = std::string("Failed to save state: ") + why + ".";
+        ShowMsg(msg.c_str(), "Save State", MB_OK | MB_ICONERROR);
+    }
 }
 
-void LoadStateFromSlot(int slot)
+static void ApplyStateBuffer(const std::vector<u8>& data)
 {
-    if (!g_romLoaded) return;
-    std::vector<u8> data;
-    if (!ReadZipStoredFirstEntry(GetStateFilePath(slot), data))
-    {
-        ShowMsg("No save state in that slot.", "Load State", MB_OK | MB_ICONWARNING);
-        return;
-    }
     if (!StateBufferMatchesLoadedRom(data))
     {
         ShowMsg("This save state was made for a different ROM and cannot be loaded.", "Load State", MB_OK | MB_ICONWARNING);
@@ -1561,12 +1719,47 @@ void LoadStateFromSlot(int slot)
 
     StateReader r(data.data(), data.size());
     g_bus.LoadState(r);
-    if (!r.ok)
+    if (!r.ok || r.pos != r.len)
     {
         StateReader rb(backup.buf.data(), backup.buf.size());
         g_bus.LoadState(rb);
-        ShowMsg("Save state is corrupt.", "Load State", MB_OK | MB_ICONERROR);
+        ShowMsg(r.ok ? "This save state does not match this version of Toast (unexpected size), so it was not loaded."
+                     : "This save state is corrupted, so it was not loaded.",
+                "Load State", MB_OK | MB_ICONERROR);
     }
+}
+
+static void LoadStateFromPath(const std::wstring& path, bool isSlot)
+{
+    std::vector<u8> data;
+    const char* why = nullptr;
+    bool notFound = false;
+    if (!ReadZipStoredFirstEntry(path, data, &why, &notFound))
+    {
+        if (notFound && isSlot)
+        {
+            ShowMsg("No save state in that slot.", "Load State", MB_OK | MB_ICONWARNING);
+        }
+        else
+        {
+            std::string msg = std::string("This save state was not loaded: ") + why + ".";
+            ShowMsg(msg.c_str(), "Load State", MB_OK | MB_ICONERROR);
+        }
+        return;
+    }
+    ApplyStateBuffer(data);
+}
+
+void SaveStateToSlot(int slot)
+{
+    if (!g_romLoaded) return;
+    SaveStateToPath(GetStateFilePath(slot));
+}
+
+void LoadStateFromSlot(int slot)
+{
+    if (!g_romLoaded) return;
+    LoadStateFromPath(GetStateFilePath(slot), true);
 }
 
 void SaveStateToZipDialog(HWND hwnd)
@@ -1584,10 +1777,7 @@ void SaveStateToZipDialog(HWND hwnd)
     ofn.lpstrTitle = L"Save State As";
     if (!GetSaveFileNameW(&ofn)) return;
 
-    StateWriter w;
-    g_bus.SaveState(w);
-    if (!WriteZipStored(fileBuf, "state.bin", w.buf))
-        ShowMsg("Failed to save state.", "Save State", MB_OK | MB_ICONERROR);
+    SaveStateToPath(fileBuf);
 }
 
 void LoadStateFromZipDialog(HWND hwnd)
@@ -1604,29 +1794,7 @@ void LoadStateFromZipDialog(HWND hwnd)
     ofn.lpstrTitle = L"Load State";
     if (!GetOpenFileNameW(&ofn)) return;
 
-    std::vector<u8> data;
-    if (!ReadZipStoredFirstEntry(fileBuf, data))
-    {
-        ShowMsg("Could not read that file.", "Load State", MB_OK | MB_ICONERROR);
-        return;
-    }
-    if (!StateBufferMatchesLoadedRom(data))
-    {
-        ShowMsg("This save state was made for a different ROM and cannot be loaded.", "Load State", MB_OK | MB_ICONWARNING);
-        return;
-    }
-
-    StateWriter backup;
-    g_bus.SaveState(backup);
-
-    StateReader r(data.data(), data.size());
-    g_bus.LoadState(r);
-    if (!r.ok)
-    {
-        StateReader rb(backup.buf.data(), backup.buf.size());
-        g_bus.LoadState(rb);
-        ShowMsg("Save state is corrupt.", "Load State", MB_OK | MB_ICONERROR);
-    }
+    LoadStateFromPath(fileBuf, false);
 }
 
 static HWND g_hexEditorHwnd = nullptr;

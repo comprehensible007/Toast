@@ -96,7 +96,6 @@ void Bus::Clock()
 
         if (dmaInProgress)
         {
-            dmaStallCount++;
             if (dmaWaitAlign)
             {
                 if (totalCycles % 2 == 1) dmaWaitAlign = false;
@@ -121,8 +120,6 @@ void Bus::Clock()
         }
         else
         {
-            dmaStallCount = 0;
-
             if (cpu) { cpu->SetIRQLine(apu.IrqRequested() || (cart && cart->IRQState())); cpu->Clock(); }
         }
     }

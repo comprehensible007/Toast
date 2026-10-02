@@ -403,7 +403,8 @@ void Apu2A03::PushSample()
     double tndSum = (t / 8227.0) + (n / 12241.0) + (d / 22638.0);
     double tndOut = (tndSum == 0.0) ? 0.0 : 159.79 / ((1.0 / tndSum) + 100.0);
 
-    double mixed = Filter(pulseOut + tndOut);
+    double expansion = (bus && bus->cart) ? bus->cart->ExpansionAudio() : 0.0;
+    double mixed = Filter(pulseOut + tndOut + expansion);
     int16_t sample = (int16_t)(mixed * 30000.0);
 
     size_t w = ringWrite.load(std::memory_order_relaxed);

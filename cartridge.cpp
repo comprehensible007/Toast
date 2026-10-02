@@ -40,12 +40,26 @@ bool Cartridge::LoadFromFile(const std::string& path)
         return false;
     }
 
-    u8 prgBanks = header[4];
-    u8 chrBanks = header[5];
+    int prgBanks = header[4];
+    int chrBanks = header[5];
     u8 flags6 = header[6];
     u8 flags7 = header[7];
 
     mapperID = (flags7 & 0xF0) | (flags6 >> 4);
+
+    bool nes2 = (flags7 & 0x0C) == 0x08;
+    int submapper = 0;
+    size_t chrRamBytes = 8192;
+    if (nes2)
+    {
+        mapperID |= (header[8] & 0x0F) << 8;
+        submapper = header[8] >> 4;
+        if ((header[9] & 0x0F) != 0x0F) prgBanks |= (header[9] & 0x0F) << 8;
+        if ((header[9] >> 4) != 0x0F) chrBanks |= (header[9] >> 4) << 8;
+        int ramShift = header[11] & 0x0F;
+        if (ramShift) chrRamBytes = (size_t)64 << ramShift;
+        if (chrRamBytes < 8192) chrRamBytes = 8192;
+    }
 
     Mirroring headerMirroring = (flags6 & 0x08) ? Mirroring::FOUR_SCREEN
                               : (flags6 & 0x01) ? Mirroring::VERTICAL
@@ -59,13 +73,13 @@ bool Cartridge::LoadFromFile(const std::string& path)
     f.read(reinterpret_cast<char*>(prgROM.data()), prgROM.size());
 
     bool chrIsRAM = (chrBanks == 0);
-    std::vector<u8> chrROM(chrIsRAM ? 8192 : static_cast<size_t>(chrBanks) * 8192, 0);
+    std::vector<u8> chrROM(chrIsRAM ? chrRamBytes : static_cast<size_t>(chrBanks) * 8192, 0);
     if (!chrIsRAM)
         f.read(reinterpret_cast<char*>(chrROM.data()), chrROM.size());
 
     romCrc = CartCrc32(prgROM, chrROM);
 
-    mapper = CreateMapper(mapperID, std::move(prgROM), std::move(chrROM), chrIsRAM, headerMirroring);
+    mapper = CreateMapper(mapperID, std::move(prgROM), std::move(chrROM), chrIsRAM, headerMirroring, submapper);
     if (!mapper)
     {
         lastError = "Mapper " + std::to_string(mapperID) + " is not implemented.";

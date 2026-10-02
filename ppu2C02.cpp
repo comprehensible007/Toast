@@ -57,7 +57,7 @@ void Ppu2C02::Reset()
     std::memset(oam, 0, sizeof(oam));
 }
 
-static inline u16 MirrorNameTable(u16 addr, Mirroring m)
+static inline u16 MirrorNameTable(u16 addr, Mirroring m, const Cartridge* cart)
 {
     addr &= 0x0FFF;
     int table = addr / 0x400;
@@ -69,6 +69,8 @@ static inline u16 MirrorNameTable(u16 addr, Mirroring m)
     case Mirroring::HORIZONTAL: physical = (table >> 1) & 1; break;
     case Mirroring::SINGLE_SCREEN_LOW:  physical = 0; break;
     case Mirroring::SINGLE_SCREEN_HIGH: physical = 1; break;
+    case Mirroring::FOUR_SCREEN: physical = table; break;
+    case Mirroring::CUSTOM: physical = cart ? cart->NtMapOf(table) : (table >> 1); break;
     default:                    physical = table & 1; break;
     }
     return static_cast<u16>(physical * 0x400 + offset);
@@ -93,8 +95,9 @@ u8 Ppu2C02::PpuRead(u16 addr) const
     }
     else if (addr < 0x3F00)
     {
-        u16 m = MirrorNameTable(addr, cart ? cart->GetMirroring() : Mirroring::HORIZONTAL);
-        return nameTable[m >= 0x400 ? 1 : 0][m & 0x3FF];
+        if (cart && cart->NametableRead(addr, data)) return data;
+        u16 m = MirrorNameTable(addr, cart ? cart->GetMirroring() : Mirroring::HORIZONTAL, cart);
+        return nameTable[m >> 10][m & 0x3FF];
     }
     else
     {
@@ -113,8 +116,9 @@ void Ppu2C02::PpuWrite(u16 addr, u8 data)
     }
     else if (addr < 0x3F00)
     {
-        u16 m = MirrorNameTable(addr, cart ? cart->GetMirroring() : Mirroring::HORIZONTAL);
-        nameTable[m >= 0x400 ? 1 : 0][m & 0x3FF] = data;
+        if (cart && cart->NametableWrite(addr, data)) return;
+        u16 m = MirrorNameTable(addr, cart ? cart->GetMirroring() : Mirroring::HORIZONTAL, cart);
+        nameTable[m >> 10][m & 0x3FF] = data;
     }
     else
     {
@@ -127,6 +131,7 @@ void Ppu2C02::PpuWrite(u16 addr, u8 data)
 u8 Ppu2C02::PpuReadFetch(u16 addr)
 {
     ppuAddressBus = addr;
+    if (cart) cart->SetFetchKind((cycle >= 257 && cycle <= 320) ? 1 : 0);
     bool high = (addr & 0x1000) != 0;
     if (high)
     {
@@ -165,6 +170,7 @@ u8 Ppu2C02::CpuRead(u16 addr)
         break;
     case 0x7:
         data = dataBuffer;
+        if (cart) cart->SetFetchKind(2);
         dataBuffer = PpuRead(vramAddr);
         if (vramAddr >= 0x3F00) data = dataBuffer;
         vramAddr += (ctrl & 0x04) ? 32 : 1;
@@ -181,6 +187,7 @@ void Ppu2C02::CpuWrite(u16 addr, u8 data)
     switch (addr)
     {
     case 0x0:
+        if ((data & 0x80) && !(ctrl & 0x80) && (status & 0x80)) nmiRequested = true;
         ctrl = data;
         tramAddr = (tramAddr & 0xF3FF) | ((data & 0x03) << 10);
         break;
@@ -221,6 +228,7 @@ void Ppu2C02::CpuWrite(u16 addr, u8 data)
         }
         break;
     case 0x7:
+        if (cart) cart->SetFetchKind(2);
         PpuWrite(vramAddr, data);
         vramAddr += (ctrl & 0x04) ? 32 : 1;
         break;
@@ -544,8 +552,14 @@ void Ppu2C02::Clock()
         }
     }
 
+    if (cycle == 4 && scanline >= 0 && scanline < 240 && (mask & 0x18))
+    {
+        if (cart) cart->OnPpuScanlineStart(scanline);
+    }
+
     if (scanline == 241 && cycle == 1)
     {
+        if (cart) cart->OnPpuVblank();
         status |= 0x80;
         if (ctrl & 0x80) nmiRequested = true;
         frameComplete = true;
@@ -572,7 +586,9 @@ void Ppu2C02::SaveState(StateWriter& w) const
 {
     w.Bytes(reinterpret_cast<const u8*>(screen.data()), screen.size() * sizeof(u32));
     w.Bool(frameComplete);
-    w.Bytes(&nameTable[0][0], sizeof(nameTable));
+    w.Bytes(&nameTable[0][0], 2048);
+    if (cart && cart->GetMirroring() == Mirroring::FOUR_SCREEN)
+        w.Bytes(&nameTable[2][0], 2048);
     w.Bytes(paletteRAM, sizeof(paletteRAM));
     w.U8(ctrl); w.U8(mask); w.U8(status);
     w.U16(vramAddr); w.U16(tramAddr); w.U8(fineX); w.Bool(addrLatch);
@@ -604,7 +620,9 @@ void Ppu2C02::LoadState(StateReader& r)
 {
     r.Bytes(reinterpret_cast<u8*>(screen.data()), screen.size() * sizeof(u32));
     frameComplete = r.Bool();
-    r.Bytes(&nameTable[0][0], sizeof(nameTable));
+    r.Bytes(&nameTable[0][0], 2048);
+    if (cart && cart->GetMirroring() == Mirroring::FOUR_SCREEN)
+        r.Bytes(&nameTable[2][0], 2048);
     r.Bytes(paletteRAM, sizeof(paletteRAM));
     ctrl = r.U8(); mask = r.U8(); status = r.U8();
     vramAddr = r.U16(); tramAddr = r.U16(); fineX = r.U8(); addrLatch = r.Bool();

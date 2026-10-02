@@ -3,4 +3,4 @@
 #include <memory>
 
 std::unique_ptr<Mapper> CreateMapper(int mapperID, std::vector<u8> prg, std::vector<u8> chr,
-                                      bool chrIsRAM, Mirroring headerMirroring);
+                                      bool chrIsRAM, Mirroring headerMirroring, int submapper = 0);

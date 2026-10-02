@@ -4,7 +4,7 @@
 #include <vector>
 #include <cstdint>
 
-enum class Mirroring { HORIZONTAL, VERTICAL, FOUR_SCREEN, SINGLE_SCREEN_LOW, SINGLE_SCREEN_HIGH };
+enum class Mirroring { HORIZONTAL, VERTICAL, FOUR_SCREEN, SINGLE_SCREEN_LOW, SINGLE_SCREEN_HIGH, CUSTOM };
 
 class Mapper
 {
@@ -24,12 +24,22 @@ public:
 
     virtual Mirroring GetMirroring() const { return mirroring; }
 
+    u8 ntMap[4] = { 0, 0, 1, 1 };
+    u8 NtMapOf(int logical) const { return ntMap[logical & 3]; }
+
+    virtual bool NametableRead(u16, u8&) { return false; }
+    virtual bool NametableWrite(u16, u8) { return false; }
+
+    virtual void SetFetchKind(int) {}
+    virtual void OnPpuScanlineStart(int) {}
+    virtual void OnPpuVblank() {}
+
+    virtual double ExpansionAudio() { return 0.0; }
+
     virtual void OnScanline() {}
     virtual void ClockCpuCycle() {}
     virtual bool IRQState() const { return false; }
     virtual void IRQClear() {}
-    virtual void SetTracing(bool) {}
-    virtual void ArmIrqTrace(int) {}
 
     virtual void SaveState(StateWriter& w) const
     {
