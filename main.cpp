@@ -35,6 +35,7 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
 
+// window stuff
 static const wchar_t* MAIN_CLASS = L"NesEmuWindowClass";
 static const wchar_t* PAD_CLASS = L"NesEmuInputConfigClass";
 static const int NES_W = 256, NES_H = 240;
@@ -71,6 +72,7 @@ HWND mainWnd = nullptr;
 BITMAPINFO frameBmi{};
 std::vector<u32> frameBuf(NES_W * NES_H, 0xFF000000);
 
+// keybinds
 struct KeyBindings
 {
     int A;
@@ -187,6 +189,7 @@ std::wstring KeyName(int vk)
     return fallback;
 }
 
+// config file
 std::wstring GetConfigDir()
 {
     wchar_t path[MAX_PATH];
@@ -261,6 +264,7 @@ void LoadKeyBindings()
     }
 }
 
+// keybinds but for toast
 struct ToastBindings
 {
     int Reset = 'R';
@@ -536,6 +540,7 @@ void OpenToastConfig(HWND owner)
     ShowWindow(hwnd, SW_SHOW);
 }
 
+// options window and saving
 static bool bgRun = false;
 static bool discordOn = true;
 
@@ -576,6 +581,7 @@ void LoadOptions()
     }
 }
 
+// sigma discord thingymabob
 static const char* DISCORD_ID = "1550792213561352334";
 
 static HANDLE dcPipe = INVALID_HANDLE_VALUE;
@@ -799,6 +805,7 @@ void SetDiscordPlaying(const std::wstring& romPath)
     LeaveCriticalSection(&dcLock);
 }
 
+// audio and timer resolution
 typedef UINT(WINAPI* TimeBeginPeriodFn)(UINT);
 typedef UINT(WINAPI* TimeEndPeriodFn)(UINT);
 static HMODULE winmmLib = nullptr;
@@ -987,6 +994,7 @@ void StopAudio()
     }
 }
 
+// other window stuff and rom loading
 void UpdateWindowTitle(HWND hwnd)
 {
     std::wstring title = L"Toast";
@@ -1050,6 +1058,7 @@ void OpenFileDialog(HWND hwnd)
     }
 }
 
+// input polling and the main frame loop
 static bool ToastWindowIsFocused()
 {
     HWND foreground = GetForegroundWindow();
@@ -1099,6 +1108,7 @@ void RunOneFrame()
     cropEdges = emuBus.ppu.LeftColumnHidden();
 }
 
+// drawing the frame to the window
 void PaintFrame(HWND hwnd)
 {
     HDC hdc = GetDC(hwnd);
@@ -1148,6 +1158,7 @@ void PaintFrame(HWND hwnd)
     ReleaseDC(hwnd, hdc);
 }
 
+// keybind window
 static HWND padCfgWnd = nullptr;
 static KeyBindings padKeysTemp[2];
 static int padListening = -1;
@@ -1324,6 +1335,7 @@ void OpenInputConfig(HWND owner)
     ShowWindow(padCfgWnd, SW_SHOW);
 }
 
+// preferences window
 static HWND prefsWnd = nullptr;
 static const wchar_t* PREFS_CLASS = L"NesEmuOptionsClass";
 static const int ID_OPT_SCALE_BASE = 400;
@@ -1517,6 +1529,7 @@ void OpenOptions(HWND owner)
     ShowWindow(prefsWnd, SW_SHOW);
 }
 
+// save state but for zip
 static u32 Crc32(const u8* data, size_t len)
 {
     static u32 table[256];
@@ -1701,6 +1714,7 @@ static bool SaveZipVerified(const std::wstring& path, const std::vector<u8>& dat
     return true;
 }
 
+// save states
 std::wstring GetStateDir()
 {
     std::wstring dir = GetConfigDir() + L"\\states";
@@ -2099,6 +2113,7 @@ void OpenHexEditor(HWND owner)
     ShowWindow(hexWnd, SW_SHOW);
 }
 
+// game genie (we do a little bit of trolling)
 struct GgEntry
 {
     std::wstring code;
@@ -2343,6 +2358,7 @@ void OpenGameGenie(HWND owner)
     ShowWindow(ggWnd, SW_SHOW);
 }
 
+// main window
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg)
@@ -2440,6 +2456,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+// program entry point
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 {
     LoadOptions();
